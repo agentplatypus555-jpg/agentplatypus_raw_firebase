@@ -1,0 +1,36 @@
+{
+  "rules": {
+    "admins": {
+      ".read": true,
+      ".write": true
+    },
+    "employees": {
+      ".read": true,
+      ".write": true
+    },
+    "projects": {
+      ".read": true,
+      ".write": true
+    },
+    "assignments": {
+      ".read": true,
+      ".write": true
+    },
+    "reports": {
+      ".read": true,
+      ".write": true
+    },
+    "tickets": {
+      ".read": true,
+      ".write": true
+    },
+    "followups": {
+      ".read": true,
+      ".write": true
+    },
+    "clients": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}
