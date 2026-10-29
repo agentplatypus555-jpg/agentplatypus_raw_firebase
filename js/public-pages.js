@@ -80,7 +80,7 @@ export async function pageLogin() {
 }
 
 export async function pageForgot() {
-  const card = startCard("New password");
+  const card = startCard("New password", "login.html");
   card.append(
     el("h1", null, "New password"),
     el("p", "lede", "Set a new password for an email that already has a login."),
@@ -102,7 +102,7 @@ export async function pageForgot() {
 }
 
 export function pageRegister() {
-  const card = startCard("Employee registration");
+  const card = startCard("Employee registration", "login.html");
   card.append(
     el("h1", null, "Employee registration"),
     el("p", "lede", "This creates an employee login."),
@@ -118,25 +118,21 @@ export function pageRegister() {
       ],
       "Create login",
       async (data) => {
-        const id = await createEmployee(data);
-        setSession({
-          kind: "employee",
-          id,
-          email: data.email.trim(),
-          fullName: data.fullName,
-          employeeCode: data.employeeCode,
-          mobile: data.mobile || "",
-          department: data.department || "",
-          designation: data.designation || "",
-        });
-        location.href = "employee.html";
+        await createEmployee({ ...data, accountStatus: "pending" });
+        card.replaceChildren(
+          el("h1", null, "Request sent"),
+          el("p", "lede", "Master Admin must approve this account before sign in works."),
+        );
+        const back = el("a", "btn solid", "Back to sign in");
+        back.href = "login.html";
+        card.append(back);
       },
     ),
   );
 }
 
 export async function pageSetup() {
-  const card = startCard("First admin");
+  const card = startCard("First admin", "login.html");
   const slot = el("div");
   slot.append(loader("Checking for an admin"));
   card.append(slot);
@@ -158,7 +154,7 @@ export async function pageSetup() {
       ],
       "Create admin",
       async (data) => {
-        const id = await createAdmin({ ...data, createdBy: "setup" });
+        const id = await createAdmin({ ...data, createdBy: "setup", accountStatus: "active" });
         setSession({
           kind: "admin",
           id,

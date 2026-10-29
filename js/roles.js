@@ -31,6 +31,15 @@ export function canSeePasswords(session) {
   return isMaster(session);
 }
 
+export function canControlAccess(session, person) {
+  if (!session || session.kind !== "admin" || !person) return false;
+  const actor = normalizeAdminRole(session.role);
+  const target = person.kind === "employee" ? "Employee" : normalizeAdminRole(person.role);
+  if (target === "Master Admin") return false;
+  if (actor === "Master Admin" || actor === "Admin") return true;
+  return actor === "HR Admin" && target === "Employee";
+}
+
 export function canEditAdmin(session, row) {
   if (isMaster(session)) return true;
   return normalizeAdminRole(row?.role) !== "Master Admin";

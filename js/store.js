@@ -30,6 +30,7 @@ export async function createAdmin(data) {
     mobile: data.mobile || "",
     ...(await passwordFields(data.password)),
     createdBy: data.createdBy || "",
+    accountStatus: data.accountStatus || "active",
   });
   return ref.key;
 }
@@ -49,8 +50,17 @@ export async function createEmployee(data) {
     department: data.department || "",
     designation: data.designation || "",
     ...(await passwordFields(data.password)),
+    accountStatus: data.accountStatus || "active",
   });
   return ref.key;
+}
+
+export function loginBlock(row) {
+  const status = row?.accountStatus || "active";
+  if (status === "active") return "";
+  if (status === "hold") return "This account is on hold. Ask the Master Admin.";
+  if (status === "rejected") return "This account was rejected.";
+  return "Waiting for Master Admin approval.";
 }
 
 export async function updateEmployee(id, data) {
@@ -98,6 +108,8 @@ export async function findLogin(email, password) {
   const admin = admins.find((row) => sameEmail(row.email, email));
   if (admin) {
     if (admin.passwordHash !== passwordHash) throw new Error("Wrong password.");
+    const blocked = loginBlock(admin);
+    if (blocked) throw new Error(blocked);
     return {
       kind: "admin",
       id: admin.id,
@@ -110,6 +122,8 @@ export async function findLogin(email, password) {
   const employee = employees.find((row) => sameEmail(row.email, email));
   if (employee) {
     if (employee.passwordHash !== passwordHash) throw new Error("Wrong password.");
+    const blocked = loginBlock(employee);
+    if (blocked) throw new Error(blocked);
     return {
       kind: "employee",
       id: employee.id,

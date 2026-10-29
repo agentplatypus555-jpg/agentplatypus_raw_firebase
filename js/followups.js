@@ -1,6 +1,7 @@
 import { clientHref, convertFollowup } from "./clients.js";
-import { addRow, deleteRow, listen, listenMany, paths, saveRow } from "./db.js";
-import { canManageFollowups } from "./roles.js";
+import { addRow, changeRow, deleteRow, listen, listenMany, paths, saveRow } from "./db.js";
+import { employeeLocked } from "./client-work.js";
+import { canManageFollowups, isMaster, normalizeAdminRole } from "./roles.js";
 import { startPortal } from "./shell.js";
 import { button, el, field, loader } from "./ui.js";
 
@@ -142,12 +143,162 @@ async function writeFeed(id, session, text, stage) {
 function employeeOptions(employees) {
   return [
     { value: "", label: "Unassigned" },
-    ...employees.map((row) => ({ value: row.id, label: `${row.fullName} · ${row.employeeCode || ""}`.trim() })),
+    ...activePeople(employees).map((row) => ({ value: row.id, label: personLabel(row, "Employee") })),
   ];
 }
 
 function pickEmployee(employees, id) {
   return employees.find((row) => row.id === id) || null;
+}
+
+function activePeople(rows) {
+  return (rows || []).filter((row) => !row.accountStatus || row.accountStatus === "active");
+}
+
+function cleanCode(code) {
+  const text = String(code || "").trim();
+  if (!text || text.toLowerCase() === "none") return "";
+  return text;
+}
+
+function personLabel(row, role) {
+  const code = cleanCode(row.employeeCode);
+  return [row.fullName || "Account", role, code].filter(Boolean).join(" · ");
+}
+
+function packPerson(row, kind) {
+  return {
+    id: row.id,
+    name: row.fullName || "Account",
+    code: cleanCode(row.employeeCode),
+    kind,
+  };
+}
+
+function assigneeMap(row) {
+  const map = { ...(row.assignees || {}) };
+  if (row.assignedTo && !map[row.assignedTo]) {
+    map[row.assignedTo] = { name: row.assignedName || "Account", code: cleanCode(row.assignedCode), kind: "employee" };
+  }
+  return map;
+}
+
+function assigneeLabel(row) {
+  const names = Object.values(assigneeMap(row)).map((person) => person.name).filter(Boolean);
+  return names.length ? names.join(", ") : "Unassigned";
+}
+
+function onFollowup(row, id) {
+  return row.assignedTo === id || Boolean(row.assignees && row.assignees[id]);
+}
+
+function assignChoices(session, employees, admins) {
+  const staff = activePeople(employees).map((row) => packPerson(row, "Employee"));
+  if (normalizeAdminRole(session.role) === "HR Admin") return staff;
+  const leaders = activePeople(admins)
+    .filter((row) => normalizeAdminRole(row.role) !== "Master Admin")
+    .map((row) => packPerson(row, normalizeAdminRole(row.role)));
+  return [...staff, ...leaders];
+}
+
+function managerSees(session, row, clients) {
+  if (isMaster(session) || !row.clientId) return true;
+  const client = (clients || []).find((item) => item.id === row.clientId);
+  return !client || !employeeLocked(session, client);
+}
+
+function openMultiAssign(ctx, row, employees, admins) {
+  const chosen = new Set(Object.keys(assigneeMap(row)));
+  const people = assignChoices(ctx.session, employees, admins);
+  const employeesOnly = normalizeAdminRole(ctx.session.role) === "HR Admin";
+  const dialog = document.createElement("dialog");
+  dialog.className = "sheet team-sheet";
+  const pop = el("div", "team-pop assign-pop");
+  const head = el("header");
+  const copy = el("div");
+  copy.append(
+    el("h2", null, "Assign follow-up"),
+    el("p", "quiet", employeesOnly
+      ? "Select the employees who should handle this follow-up."
+      : "Select employees, HR Admins, or Admins. Master Admin already sees every follow-up."),
+  );
+  const close = button("×", "icon-btn", () => dialog.close());
+  close.setAttribute("aria-label", "Close");
+  head.append(copy, close);
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search name or role";
+  search.setAttribute("aria-label", "Search people");
+  const host = el("div", "team-pop-list");
+  const paint = () => {
+    const query = search.value.trim().toLowerCase();
+    const shown = people.filter((person) => !query || `${person.name} ${person.kind} ${person.code}`.toLowerCase().includes(query));
+    if (!shown.length) {
+      host.replaceChildren(el("p", "quiet", "No one matches."));
+      return;
+    }
+    host.replaceChildren(...shown.map((person, index) => {
+      const line = el("label", `assign-pick${chosen.has(person.id) ? " on" : ""}`);
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = chosen.has(person.id);
+      box.addEventListener("change", () => {
+        if (box.checked) chosen.add(person.id);
+        else chosen.delete(person.id);
+        line.classList.toggle("on", box.checked);
+      });
+      const text = el("span");
+      text.append(el("strong", null, person.name), el("small", null, [person.kind, person.code].filter(Boolean).join(" · ")));
+      line.append(el("b", "req-no", String(index + 1)), box, text);
+      return line;
+    }));
+  };
+  search.addEventListener("input", paint);
+  const footer = el("footer");
+  footer.append(
+    button("Cancel", "btn ghost", () => dialog.close()),
+    button("Save", "btn solid", async () => {
+      const picked = people.filter((person) => chosen.has(person.id));
+      dialog.close();
+      await writeAssignees(ctx, row, picked);
+    }),
+  );
+  pop.append(head, search, host, footer);
+  dialog.append(pop);
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  paint();
+  dialog.showModal();
+  search.focus();
+}
+
+async function writeAssignees(ctx, row, people) {
+  const assignees = {};
+  people.forEach((person) => {
+    assignees[person.id] = { name: person.name, code: person.code || "", kind: person.kind };
+  });
+  const first = people[0];
+  const names = people.map((person) => person.name).filter(Boolean);
+  try {
+    await changeRow(paths.followups, row.id, (current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        assignees,
+        assignedTo: first?.id || "",
+        assignedName: names.join(", "),
+        assignedCode: first?.code || "",
+        assignedBy: ctx.session.id,
+      };
+    });
+    await writeFeed(row.id, ctx.session, names.length ? `Assigned to ${names.join(", ")}.` : "Unassigned.", row.stage);
+    ctx.toast(names.length ? `Assigned to ${names.join(", ")}` : "Unassigned");
+  } catch (error) {
+    ctx.toast(error.message || "Could not assign.");
+  }
 }
 
 export function pageAdminFollowups(session) {
@@ -235,8 +386,8 @@ function renderFollowups(session, page, employeeOnly) {
   );
 
   const allRows = () => employeeOnly
-    ? latest.followups.filter((row) => row.assignedTo === session.id)
-    : latest.followups;
+    ? latest.followups.filter((row) => onFollowup(row, session.id))
+    : latest.followups.filter((row) => managerSees(session, row, latest.clients));
 
   const visible = () => {
     const rows = allRows();
@@ -262,15 +413,16 @@ function renderFollowups(session, page, employeeOnly) {
     if (!shown.length) {
       list.replaceChildren(el("p", "quiet", employeeOnly ? "No client follow-up is assigned to you yet." : "No follow-ups in this stage."));
     } else {
-      list.replaceChildren(...shown.map((row) => leadCard(ctx, row, latest.employees, manage, stageCounts)));
+      list.replaceChildren(...shown.map((row) => leadCard(ctx, linkedFollowup(row, latest.clients), latest.employees, latest.admins || [], manage, stageCounts)));
     }
     const events = shown.flatMap((row) => feedItems(row).slice(0, 4).map((item) => ({ ...item, client: row.clientName })))
+      .filter((item) => canManageFollowups(session) || !isMoneyUpdate(item))
       .sort((a, b) => (b.at || 0) - (a.at || 0))
       .slice(0, 12);
     feedBox.replaceChildren(el("h2", null, `Live feed · ${events.length}`), events.length ? feedList(events) : el("p", "quiet", "No updates yet."));
   };
 
-  watch(["followups", "employees"], (data) => {
+  watch(["followups", "employees", "admins", "clients"], (data) => {
     if (!data) {
       list.replaceChildren(el("p", "quiet", "Firebase refused this read. Check the database rules, then refresh."));
       return;
@@ -278,6 +430,19 @@ function renderFollowups(session, page, employeeOnly) {
     latest = data;
     paint();
   });
+}
+
+function linkedFollowup(row, clients) {
+  if (!row.clientId) return row;
+  const client = (clients || []).find((item) => item.id === row.clientId);
+  if (!client) return row;
+  const keys = ["clientName", "companyName", "location", "contactNumber", "email", "address", "city", "state", "pincode", "website", "industry", "gst", "designation", "alternateNumber", "clientCode"];
+  const patch = {};
+  keys.forEach((key) => {
+    if (client[key] && client[key] !== row[key]) patch[key] = client[key];
+  });
+  if (Object.keys(patch).length) saveRow(paths.followups, row.id, patch);
+  return { ...row, ...patch };
 }
 
 function metric(label, value, color) {
@@ -293,7 +458,7 @@ function stageChip(label, count, on, color, onClick) {
   return node;
 }
 
-function leadCard(ctx, row, employees, manage, stageCounts) {
+function leadCard(ctx, row, employees, admins, manage, stageCounts) {
   const stage = stageOf(row.stage);
   const card = el("article", "fu-card");
   card.style.setProperty("--accent", stage.color);
@@ -304,7 +469,10 @@ function leadCard(ctx, row, employees, manage, stageCounts) {
   mark.style.background = `${stage.color}22`;
   mark.style.color = stage.color;
   const names = el("div");
-  names.append(el("strong", null, row.clientName || "Unnamed client"), el("p", "quiet", `${row.companyName || "No company"} · ${row.location || "No location"}`));
+  names.append(
+    el("strong", null, row.clientName || "Unnamed client"),
+    el("p", "quiet", [row.clientCode, row.companyName || "No company", row.location || "No location"].filter(Boolean).join(" · ")),
+  );
   title.append(mark, names);
   const badge = el("span", "fu-badge", `${stage.label} · ${stageCounts?.[row.stage] || 0}`);
   badge.style.background = `${stage.color}22`;
@@ -315,14 +483,17 @@ function leadCard(ctx, row, employees, manage, stageCounts) {
   end.append(chatBtn, badge);
   head.append(title, end);
   const facts = el("div", "fu-facts");
+  const money = canManageFollowups(ctx.session);
   const factItems = [
     { label: "Contact", value: row.contactNumber, color: stageOf("contacted").color },
     { label: "Response", value: row.initialResponse, color: stageOf("response").color },
-    { label: "Quote", value: row.quoteAmount ? `₹ ${row.quoteAmount}` : row.quoteNotes, color: stageOf("quote").color },
+    ...(money ? [{ label: "Quote", value: row.quoteAmount ? `₹ ${row.quoteAmount}` : row.quoteNotes, color: stageOf("quote").color }] : []),
     { label: "Expectations", value: row.expectations, color: stageOf("expectations").color },
-    { label: "Payment", value: paymentLabel(row), color: stageOf("payment").color },
-    { label: "Final amount", value: row.finalAmount ? `₹ ${row.finalAmount}` : "", color: stageOf("amount").color },
-    { label: "Assigned", value: row.assignedName || "Unassigned", color: stageOf("target").color },
+    ...(money ? [
+      { label: "Payment", value: paymentLabel(row), color: stageOf("payment").color },
+      { label: "Final amount", value: row.finalAmount ? `₹ ${row.finalAmount}` : "", color: stageOf("amount").color },
+    ] : []),
+    { label: "Assigned", value: assigneeLabel(row), color: stageOf("target").color },
   ];
   factItems.forEach((spec, index) => {
     const item = el("article", "fu-fact");
@@ -345,7 +516,7 @@ function leadCard(ctx, row, employees, manage, stageCounts) {
   const barLabel = el("p", "fu-bar-label", currentActor
     ? `${percent}% · ${stage.label} by ${currentActor.name}`
     : `${percent}% complete before onboard`);
-  const gaps = missingForOnboard(row);
+  const gaps = missingForOnboard(row).filter((item) => canManageFollowups(ctx.session) || !["Quote", "Successful payment", "Final fixed amount"].includes(item));
   const gapLine = el("p", "fu-gaps", row.stage === "success"
     ? "Onboard setup is complete."
     : (gaps.length ? `Still needed: ${gaps.join(", ")}` : "Ready to mark onboard complete."));
@@ -397,7 +568,7 @@ function leadCard(ctx, row, employees, manage, stageCounts) {
     actions.append(button(next === row.stage ? "Update" : `Next · ${stageOf(next).label}`, "btn solid", () => openStageSpot(ctx, row, next)));
   }
   if (manage) {
-    actions.append(button(row.assignedTo ? "Reassign" : "Assign", "btn ghost", () => assignLead(ctx, row, employees)));
+    actions.append(button(Object.keys(assigneeMap(row)).length ? "Reassign" : "Assign", "btn ghost", () => assignLead(ctx, row, employees, admins)));
     actions.append(button("Delete", "btn warn", async () => {
       if (!await ctx.ask(`Remove follow-up for ${row.clientName}?`)) return;
       await deleteRow(paths.followups, row.id);
@@ -417,14 +588,14 @@ function bubbleNode(item, session) {
   return bubble;
 }
 
-function stageMessages(row, id) {
+function stageMessages(row, id, session) {
   const items = feedItems(row).slice().reverse();
   const grouped = items.filter((item) => (item.stage || row.stage || "target") === id);
-  return messagesForStage(row, id, grouped);
+  return messagesForStage(row, id, grouped, session);
 }
 
 function paintStageThread(thread, row, session, stageId) {
-  const msgs = stageMessages(row, stageId);
+  const msgs = stageMessages(row, stageId, session);
   const wrap = el("div", "fu-chat-col");
   if (!msgs.length) wrap.append(el("p", "fu-empty", "No messages yet. Send an update."));
   else msgs.forEach((msg) => wrap.append(bubbleNode(msg, session)));
@@ -441,7 +612,7 @@ function paintGroupedChat(thread, row, session, focusId) {
   });
   const wrap = el("div", "fu-chat-col");
   STAGES.forEach((item) => {
-    const msgs = messagesForStage(row, item.id, groups[item.id] || []);
+    const msgs = messagesForStage(row, item.id, groups[item.id] || [], session);
     if (!msgs.length && item.id !== focusId) return;
     const section = el("section", `fu-chat-section${item.id === focusId ? " focus" : ""}`);
     section.dataset.stage = item.id;
@@ -491,7 +662,13 @@ function isGenericStatus(text) {
     || /^(new target|already contacted) opened/i.test(value);
 }
 
-function messagesForStage(row, id, msgs) {
+function isMoneyUpdate(item) {
+  if (["quote", "payment", "amount"].includes(item.stage)) return true;
+  return /₹|quote\s*:|payment\s*:|final amount/i.test(String(item.text || ""));
+}
+
+function messagesForStage(row, id, msgs, session) {
+  if (session && !canManageFollowups(session) && ["quote", "payment", "amount"].includes(id)) return [];
   const content = contentForStage(row, id);
   const useful = msgs.filter((item) => item.text && !isGenericStatus(item.text));
   const hasContent = content && useful.some((item) => item.text.includes(content.split("\n")[0]));
@@ -581,24 +758,8 @@ async function createLead(ctx, employees) {
   ctx.toast("Follow-up created");
 }
 
-async function assignLead(ctx, row, employees) {
-  const data = await ctx.openForm({
-    title: row.assignedTo ? "Reassign follow-up" : "Assign follow-up",
-    submitLabel: "Save",
-    fields: [
-      { key: "assignedTo", label: "Employee", type: "select", options: employeeOptions(employees), value: row.assignedTo || "" },
-    ],
-  });
-  if (!data) return;
-  const person = pickEmployee(employees, data.assignedTo);
-  await saveRow(paths.followups, row.id, {
-    assignedTo: person?.id || "",
-    assignedName: person?.fullName || "",
-    assignedCode: person?.employeeCode || "",
-    assignedBy: ctx.session.id,
-  });
-  await writeFeed(row.id, ctx.session, person ? `Assigned to ${person.fullName}.` : "Unassigned.", row.stage);
-  ctx.toast(person ? `Assigned to ${person.fullName}` : "Unassigned");
+async function assignLead(ctx, row, employees, admins = []) {
+  openMultiAssign(ctx, row, employees, admins);
 }
 
 function fillExtras(extras, row, focus, session) {
@@ -608,7 +769,7 @@ function fillExtras(extras, row, focus, session) {
   if (focus === "success" || focus === "failed") {
     specs.push(...fieldsForStage(focus, row).filter((spec) => spec.key === "outcome"));
   }
-  if (ownsStage(row, focus, session)) {
+  if (ownsStage(row, focus, session) && canManageFollowups(session)) {
     specs.push(...fieldsForStage(focus, row).filter((spec) => ["quoteAmount", "quoteNotes", "paymentStatus", "paymentAmount", "finalAmount"].includes(spec.key)));
   }
   if (!specs.length) return;

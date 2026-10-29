@@ -1,9 +1,10 @@
-import { addRow, deleteRow, listenMany, paths, readList, saveRow } from "./db.js";
+import { addRow, changeRow, deleteRow, listenMany, paths, readList, saveRow } from "./db.js";
 import { formatWhen, stamp, todayIso, yesterdayIso } from "./records.js";
-import { canEditAdmin, canSeePasswords, isLastMaster, normalizeAdminRole, roleChoices } from "./roles.js";
-import { setSession } from "./session.js";
+import { ADMIN_ROLES, canControlAccess, canManageAdmins, canSeePasswords, isLastMaster, isMaster, normalizeAdminRole, roleChoices } from "./roles.js";
+import { hashPassword, setSession } from "./session.js";
+import { employeeLocked } from "./client-work.js";
 import { startPortal } from "./shell.js";
-import { createAdmin, createEmployee, deleteEmployee, updateAdmin, updateEmployee } from "./store.js";
+import { createAdmin, createEmployee, deleteEmployee, emailTaken, updateAdmin, updateEmployee } from "./store.js";
 import {
   accountRemoved,
   button,
@@ -509,19 +510,21 @@ function passwordField(ctx, row, required) {
 
 function tableWrap(headers, rows) {
   if (!rows.length) return el("p", "quiet", "No accounts match this filter.");
+  const labels = ["S.No", ...headers];
   const wrap = el("div", "table-wrap");
   const table = document.createElement("table");
   table.className = "data-table";
   const head = document.createElement("thead");
   const headRow = document.createElement("tr");
-  headers.forEach((label) => headRow.append(el("th", null, label)));
+  labels.forEach((label) => headRow.append(el("th", null, label)));
   head.append(headRow);
   const body = document.createElement("tbody");
-  rows.forEach((cells) => {
+  rows.forEach((cells, index) => {
     const tr = document.createElement("tr");
-    cells.forEach((cell, index) => {
+    const full = [el("span", "req-no", String(index + 1)), ...cells];
+    full.forEach((cell, cellIndex) => {
       const td = document.createElement("td");
-      td.dataset.label = headers[index];
+      td.dataset.label = labels[cellIndex];
       if (cell instanceof Node) td.append(cell);
       else td.textContent = cell || "—";
       tr.append(td);
@@ -553,59 +556,522 @@ export function pageEmployees(session) {
   const ctx = startPortal(session, "admin-employees");
   ctx.setHeading("Admin", "Employees");
   ctx.actions.append(button("Add account", "btn solid", () => createEmp(ctx)));
-  const showPassword = canSeePasswords(session);
-  const headers = ["Name", "Code", "Email", "Mobile", "Department", "Role", ...(showPassword ? ["Password"] : []), "Actions"];
-  let latest = [];
+  let employees = [];
+  let clients = [];
   let role = "All";
+  let query = "";
   const filter = roleFilter([], (value) => {
     role = value;
     paint();
   });
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search name, code, email, or client";
+  search.setAttribute("aria-label", "Search employees");
+  search.addEventListener("input", () => {
+    query = search.value.trim().toLowerCase();
+    paint();
+  });
+  const tools = el("div", "toolbar cl-filters");
+  tools.append(search, filter.bar);
   const list = el("div", "stack");
   list.append(loader("Loading employees"));
-  ctx.panel.append(el("p", "lede", "All employee accounts."), filter.bar, list);
+  ctx.panel.append(el("p", "lede", accessLede(session, "employee")), tools, list);
   const paint = () => {
-    ctx.setHeading("Admin", `Employees · ${latest.length}`);
-    const roles = [...new Set(latest.map((row) => row.designation).filter(Boolean))].sort();
+    ctx.setHeading("Admin", `Employees · ${employees.length}`);
+    const roles = [...new Set(employees.map((row) => row.designation).filter(Boolean))].sort();
     const current = filter.select.value;
     filter.select.replaceChildren();
     ["All", ...roles].forEach((name) => {
-      const count = name === "All" ? latest.length : latest.filter((row) => row.designation === name).length;
+      const count = name === "All" ? employees.length : employees.filter((row) => row.designation === name).length;
       const option = el("option", null, `${name} · ${count}`);
       option.value = name;
       filter.select.append(option);
     });
     filter.select.value = roles.includes(current) || current === "All" ? current : "All";
     role = filter.select.value;
-    const rows = latest.filter((row) => role === "All" || row.designation === role);
-    list.replaceChildren(tableWrap(headers, rows.map((row) => {
-      const actions = el("div", "actions");
-      actions.append(
-        button("Edit", "btn ghost", () => editEmp(ctx, row)),
-        button("Delete", "btn warn", async () => {
-          if (!await ctx.ask(`Remove ${row.fullName}? Reports stay.`)) return;
-          await deleteEmployee(row);
-          ctx.toast("Removed");
-        }),
-      );
-      const cells = [
-        row.fullName,
-        row.employeeCode,
-        row.email,
-        row.mobile,
-        row.department,
-        row.designation || "Employee",
-      ];
-      if (showPassword) cells.push(row.password || "Not stored yet");
-      cells.push(actions);
-      return cells;
-    })));
+    const rows = employees.filter((row) => {
+      if (role !== "All" && row.designation !== role) return false;
+      if (!query) return true;
+      const blob = [row.fullName, row.employeeCode, row.email, row.mobile, row.department, row.designation].join(" ").toLowerCase();
+      return blob.includes(query);
+    });
+    if (!rows.length) {
+      list.replaceChildren(el("p", "quiet", "No employees match this search."));
+      return;
+    }
+    const board = el("div", "emp-board");
+    rows.forEach((row, index) => board.append(personRow(ctx, row, clients, index + 1, "employee")));
+    list.replaceChildren(board);
   };
-  watch(["employees"], (data) => {
+  watch(["employees", "clients"], (data) => {
     if (!data) return denied(list);
-    latest = data.employees;
+    employees = data.employees || [];
+    clients = [...(data.clients || [])].sort((a, b) => String(a.companyName || "").localeCompare(String(b.companyName || "")));
     paint();
   });
+}
+
+function personRow(ctx, row, clients, serial, kind) {
+  const master = isMaster(ctx.session);
+  const card = el("article", "emp-row");
+  const who = master ? el("a", "emp-who") : el("div", "emp-who");
+  if (master) who.href = `${kind === "admin" ? "admin-admin" : "admin-employee"}.html?id=${encodeURIComponent(row.id)}`;
+  who.append(el("span", "req-no", String(serial)));
+  const photo = el("b", null, (row.fullName || "E").slice(0, 1).toUpperCase());
+  const copy = el("div");
+  const masterAccount = kind === "admin" && normalizeAdminRole(row.role) === "Master Admin";
+  const control = canControlPerson(ctx.session, row, kind);
+  const pool = control ? clientsFor(ctx.session, clients) : [];
+  const handled = masterAccount ? clients : clients.filter((client) => handlesClient(row.id, client));
+  const subtitle = kind === "admin"
+    ? normalizeAdminRole(row.role)
+    : [row.designation || "Employee", cleanCode(row.employeeCode)].filter(Boolean).join(" · ");
+  copy.append(
+    el("strong", null, row.fullName || "Account"),
+    el("small", null, subtitle || "Account"),
+    el("em", null, masterAccount ? "Sees every client" : `${handled.length} on`),
+  );
+  who.append(photo, copy);
+  const projects = el("div", "emp-projects");
+  if (masterAccount) {
+    projects.append(el("span", "quiet", "A Master Admin already sees every client. Another Master Admin manages this account."));
+  } else if (control) {
+    if (!pool.length) projects.append(el("span", "quiet", "No clients you can assign."));
+    else pool.forEach((client) => projects.append(projectChip(ctx, row, client)));
+  } else if (!handled.length) {
+    projects.append(el("span", "quiet", "No clients"));
+  } else {
+    projects.append(el("span", "quiet", handled.map((client) => client.companyName || client.clientName || "Client").join(", ")));
+  }
+  card.append(who, projects);
+  return card;
+}
+
+export function pageEmployeeFile(session) {
+  if (!isMaster(session)) {
+    location.replace("admin-employees.html");
+    return;
+  }
+  openPerson(session, "employee");
+}
+
+export function pageAdminFile(session) {
+  if (!isMaster(session)) {
+    location.replace("admin-admins.html");
+    return;
+  }
+  openPerson(session, "admin");
+}
+
+function openPerson(session, kind) {
+  const ctx = startPortal(session, kind === "admin" ? "admin-admins" : "admin-employees");
+  const id = new URLSearchParams(location.search).get("id") || "";
+  const back = kind === "admin" ? "admin-admins.html" : "admin-employees.html";
+  ctx.setHeading("Admin", kind === "admin" ? "Admin" : "Employee");
+  ctx.setBack(back, kind === "admin" ? "Back to admins" : "Back to employees");
+  const stage = el("div", "stack");
+  stage.append(loader(kind === "admin" ? "Loading admin" : "Loading employee"));
+  ctx.panel.append(stage);
+  if (!id) {
+    stage.replaceChildren(el("p", "quiet", "This profile link is missing."));
+    return;
+  }
+  let query = "";
+  let mode = "All";
+  const listKey = kind === "admin" ? "admins" : "employees";
+  watch([listKey, "clients"], (data) => {
+    if (!data) return denied(stage);
+    const row = (data[listKey] || []).find((item) => item.id === id);
+    if (!row) {
+      stage.replaceChildren(el("p", "quiet", "This profile was not found."));
+      return;
+    }
+    const clients = [...(data.clients || [])].sort((a, b) => String(a.companyName || "").localeCompare(String(b.companyName || "")));
+    ctx.setHeading("Admin", row.fullName || "Account");
+    stage.replaceChildren(employeeFile(ctx, row, clients, kind, () => query, (value) => { query = value; }, () => mode, (value) => { mode = value; }));
+  });
+}
+
+function employeeFile(ctx, row, clients, kind, readQuery, writeQuery, readMode, writeMode) {
+  const page = el("div", "stack");
+  const hero = el("header", "profile-hero");
+  hero.append(el("b", "profile-photo", (row.fullName || "E").slice(0, 1).toUpperCase()));
+  const who = el("div", "profile-who");
+  const subtitle = kind === "admin"
+    ? normalizeAdminRole(row.role)
+    : [row.designation || "Employee", row.department].filter(Boolean).join(" · ");
+  who.append(
+    el("h1", null, row.fullName || "Account"),
+    el("p", null, subtitle || "Account"),
+  );
+  const chips = el("div", "profile-chips");
+  chips.append(
+    el("span", "profile-chip code", kind === "admin" ? normalizeAdminRole(row.role) : (cleanCode(row.employeeCode) || "No code")),
+    el("span", "profile-chip status", accountLabel(row.accountStatus)),
+    el("span", "profile-chip location", `Hired ${hiredOn(row.createdAt)}`),
+  );
+  who.append(chips);
+  const actions = el("div", "profile-tools emp-actions");
+  actions.append(button("Delete", "btn warn", () => removePerson(ctx, row, kind)));
+  hero.append(who, actions);
+  const details = el("section", "profile-card");
+  details.append(el("h2", null, "Account"));
+  const tiles = el("div", "profile-tiles");
+  staffFields(row, ctx.session, kind).forEach((spec) => tiles.append(staffTile(ctx, row, spec, kind)));
+  tiles.append(lockedTile("Account", accountLabel(row.accountStatus)));
+  tiles.append(lockedTile("Hired", hiredOn(row.createdAt)));
+  details.append(tiles);
+  page.append(hero, details);
+  if (kind === "admin" && normalizeAdminRole(row.role) === "Master Admin") {
+    const note = el("section", "profile-card");
+    note.append(
+      el("h2", null, "Clients"),
+      el("p", "quiet", "This Master Admin already sees every client. Access switches are not used on a Master account. Another Master Admin can edit this account."),
+    );
+    page.append(note);
+  } else {
+    page.append(assignCard(ctx, row, clients, readQuery, writeQuery, readMode, writeMode));
+  }
+  return page;
+}
+
+async function removePerson(ctx, row, kind) {
+  if (kind === "admin") {
+    const admins = await readList(paths.admins);
+    if (admins.length <= 1) {
+      ctx.toast("The last admin cannot be deleted.");
+      return;
+    }
+    if (isLastMaster(admins, row)) {
+      ctx.toast("The last Master Admin cannot be deleted.");
+      return;
+    }
+  }
+  if (!await ctx.ask(`Remove ${row.fullName}? Reports stay.`)) return;
+  if (kind === "admin") {
+    await deleteRow(paths.admins, row.id);
+    if (row.id === ctx.session.id) {
+      const { clearSession } = await import("./session.js");
+      clearSession();
+      location.href = "login.html";
+      return;
+    }
+    ctx.toast("Removed");
+    location.href = "admin-admins.html";
+    return;
+  }
+  await deleteEmployee(row);
+  ctx.toast("Removed");
+  location.href = "admin-employees.html";
+}
+
+function assignCard(ctx, row, clients, readQuery, writeQuery, readMode, writeMode) {
+  const card = el("section", "profile-card");
+  const handled = clients.filter((client) => handlesClient(row.id, client)).length;
+  card.append(el("h2", null, `Clients · ${handled} on`));
+  card.append(el("p", "quiet", "Turn a client on to assign it. Turn it off to remove access. Work already posted stays on the client."));
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search clients";
+  search.setAttribute("aria-label", "Search clients");
+  search.value = readQuery();
+  const modes = el("div", "fu-chips");
+  ["All", "On", "Off"].forEach((name) => {
+    modes.append(button(name, `fu-chip${readMode() === name ? " on" : ""}`, () => {
+      writeMode(name);
+      [...modes.children].forEach((node) => node.classList.toggle("on", node.textContent.trim() === name));
+      paint();
+    }));
+  });
+  const tools = el("div", "emp-project-tools");
+  tools.append(search, modes);
+  const host = el("div", "proj-list");
+  const paint = () => {
+    const query = readQuery().trim().toLowerCase();
+    const mode = readMode();
+    const shown = clients.filter((client) => {
+      const on = handlesClient(row.id, client);
+      if (mode === "On" && !on) return false;
+      if (mode === "Off" && on) return false;
+      if (!query) return true;
+      return [client.companyName, client.clientName, client.clientCode, client.location].join(" ").toLowerCase().includes(query);
+    });
+    if (!shown.length) {
+      host.replaceChildren(el("p", "quiet", "No clients match."));
+      return;
+    }
+    host.replaceChildren(...shown.map((client, index) => projectLine(ctx, row, client, index + 1)));
+  };
+  search.addEventListener("input", () => {
+    writeQuery(search.value);
+    paint();
+  });
+  card.append(tools, host);
+  paint();
+  return card;
+}
+
+function projectLine(ctx, employee, client, serial) {
+  const on = handlesClient(employee.id, client);
+  const line = el("div", `proj-line${on ? " on" : ""}`);
+  line.append(el("span", "req-no", String(serial)));
+  const copy = el("div");
+  copy.append(el("strong", null, client.companyName || client.clientName || "Client"));
+  copy.append(el("small", null, [client.clientCode, client.clientName].filter(Boolean).join(" · ") || "Client"));
+  line.append(copy, accessSwitch(ctx, employee, client, on));
+  return line;
+}
+
+function projectChip(ctx, employee, client) {
+  const on = handlesClient(employee.id, client);
+  const chip = el("span", `proj-chip${on ? " on" : ""}`);
+  chip.append(el("b", null, client.companyName || client.clientName || "Client"));
+  chip.append(accessSwitch(ctx, employee, client, on));
+  return chip;
+}
+
+function accessSwitch(ctx, employee, client, on) {
+  const toggle = button("", `dm-switch${on ? " on" : ""}`, () => setHandling(ctx, employee, client, !on));
+  toggle.setAttribute("aria-pressed", String(on));
+  toggle.setAttribute("aria-label", `${on ? "Remove" : "Assign"} ${client.companyName || "client"} for ${employee.fullName || "employee"}`);
+  toggle.append(el("i"));
+  return toggle;
+}
+
+function canControlPerson(session, row, kind) {
+  return canControlAccess(session, kind === "employee" ? { kind: "employee" } : { kind: "admin", role: row.role });
+}
+
+function clientsFor(session, clients) {
+  if (isMaster(session)) return clients;
+  return clients.filter((client) => !employeeLocked(session, client));
+}
+
+function accessLede(session, page) {
+  const role = normalizeAdminRole(session.role);
+  if (page === "employee") {
+    if (isMaster(session)) return "Turn client access on or off for any employee, HR Admin, or Admin. A Master Admin already sees every client.";
+    if (role === "HR Admin") return "Turn a client on to give an employee access, or off to remove it.";
+    return "Turn client access on or off for any employee. Admin and HR Admin access is on the Admins page. Master Admin accounts are not included.";
+  }
+  if (isMaster(session)) return "Turn a client on or off for an Admin or an HR Admin. A Master Admin already sees every client.";
+  return "Turn a client on or off for an Admin or an HR Admin. Master Admin accounts are not included.";
+}
+
+function handlesClient(employeeId, client) {
+  return client.assignedTo === employeeId || Boolean(client.crew && client.crew[employeeId]);
+}
+
+async function setHandling(ctx, employee, client, on) {
+  const kind = employee.role ? "admin" : "employee";
+  if (!canControlPerson(ctx.session, employee, kind)) {
+    ctx.toast("You can't change access for this account.");
+    return;
+  }
+  if (!isMaster(ctx.session) && employeeLocked(ctx.session, client)) {
+    ctx.toast("This client is turned off for your account.");
+    return;
+  }
+  try {
+    await changeRow(paths.clients, client.id, (current) => {
+      if (!current) return current;
+      const crew = { ...(current.crew || {}) };
+      const accessHold = { ...(current.accessHold || {}) };
+      delete accessHold[employee.id];
+      if (on) {
+        crew[employee.id] = { ...(crew[employee.id] || {}), name: employee.fullName || "Employee" };
+        return { ...current, crew, accessHold };
+      }
+      delete crew[employee.id];
+      const next = { ...current, crew, accessHold };
+      if (current.assignedTo === employee.id) {
+        next.assignedTo = "";
+        next.assignedName = "";
+        next.assignedCode = "";
+      }
+      return next;
+    });
+    ctx.toast(on ? `${employee.fullName} can handle ${client.companyName || "this client"}.` : `${employee.fullName} was removed from ${client.companyName || "this client"}.`);
+  } catch (error) {
+    ctx.toast(error.message || "Could not update access.");
+  }
+}
+
+function staffFields(row, session, kind) {
+  if (kind === "admin") {
+    const fields = [
+      { key: "fullName", label: "Name", required: true, value: row.fullName || "" },
+      { key: "role", label: "Role", type: "select", required: true, value: normalizeAdminRole(row.role), options: ADMIN_ROLES },
+      { key: "email", label: "Email", type: "email", required: true, value: row.email || "" },
+      { key: "mobile", label: "Mobile", value: row.mobile || "" },
+    ];
+    if (canSeePasswords(session)) fields.push({ key: "password", label: "Password", value: row.password || "" });
+    return fields;
+  }
+  const fields = [
+    { key: "fullName", label: "Name", required: true, value: row.fullName || "" },
+    { key: "employeeCode", label: "Employee code", required: true, value: cleanCode(row.employeeCode) },
+    { key: "email", label: "Email", type: "email", required: true, value: row.email || "" },
+    { key: "mobile", label: "Mobile", value: row.mobile || "" },
+    { key: "department", label: "Department", value: row.department || "" },
+    { key: "designation", label: "Designation", value: row.designation || "" },
+  ];
+  if (canSeePasswords(session)) fields.push({ key: "password", label: "Password", value: row.password || "" });
+  return fields;
+}
+
+function staffTile(ctx, row, spec, kind) {
+  const item = el("div", "profile-tile");
+  paintStaff(item, ctx, row, spec, kind);
+  return item;
+}
+
+function paintStaff(item, ctx, row, spec, kind) {
+  item.classList.remove("editing");
+  const top = el("div", "profile-tile-top");
+  const edit = button("", "profile-pen", () => editStaff(ctx, row, spec, item, kind));
+  edit.setAttribute("aria-label", `Edit ${spec.label}`);
+  edit.append(penIcon());
+  top.append(tileMark(spec.label), edit);
+  const shown = spec.key === "role" ? normalizeAdminRole(spec.value) : (spec.value || "—");
+  item.replaceChildren(top, el("span", null, spec.label), el("b", null, shown));
+}
+
+function editStaff(ctx, row, spec, item, kind) {
+  if (item.classList.contains("editing")) return;
+  item.classList.add("editing");
+  let input;
+  if (spec.type === "select") {
+    input = document.createElement("select");
+    (spec.options || []).forEach((option) => {
+      const node = el("option", null, option);
+      node.value = option;
+      input.append(node);
+    });
+  } else {
+    input = document.createElement("input");
+    input.type = spec.type || "text";
+  }
+  input.className = "profile-input";
+  input.value = spec.value || "";
+  input.setAttribute("aria-label", spec.label);
+  const actions = el("div", "profile-row-actions");
+  const save = button("Save", "btn solid", async () => {
+    const next = input.value.trim();
+    save.disabled = true;
+    try {
+      await saveStaffField(ctx, row, spec, next, kind);
+      ctx.toast("Saved");
+    } catch (error) {
+      save.disabled = false;
+      ctx.toast(error.message || "Could not save.");
+    }
+  });
+  actions.append(save, button("Cancel", "btn ghost", () => paintStaff(item, ctx, row, spec, kind)));
+  const stack = el("div", "profile-edit");
+  stack.append(input, actions);
+  const top = el("div", "profile-tile-top");
+  top.append(tileMark(spec.label));
+  item.replaceChildren(top, el("span", null, spec.label), stack);
+  input.focus();
+}
+
+async function saveStaffField(ctx, row, spec, next, kind) {
+  if (spec.required && !next) throw new Error(`${spec.label} is required.`);
+  const path = kind === "admin" ? paths.admins : paths.employees;
+  if (spec.key === "email") {
+    if (await emailTaken(next, { id: row.id })) throw new Error("That email already has a login.");
+  }
+  if (spec.key === "employeeCode") {
+    const employees = await readList(paths.employees);
+    const taken = employees.some((item) => item.id !== row.id && String(item.employeeCode || "").toLowerCase() === next.toLowerCase());
+    if (taken) throw new Error("That employee code is already used.");
+  }
+  if (spec.key === "role") {
+    const role = normalizeAdminRole(next);
+    const admins = await readList(paths.admins);
+    if (isLastMaster(admins, row) && role !== "Master Admin") throw new Error("The last Master Admin must keep that role.");
+    await saveRow(path, row.id, { role });
+    if (row.id === ctx.session.id) {
+      const nextSession = { ...ctx.session, role };
+      setSession(nextSession);
+      ctx.session = nextSession;
+    }
+    return;
+  }
+  if (spec.key === "password") {
+    if (next.length < 6) throw new Error("Use at least 6 characters for the password.");
+    await saveRow(path, row.id, { password: next, passwordHash: await hashPassword(next) });
+    return;
+  }
+  await saveRow(path, row.id, { [spec.key]: next });
+  if (spec.key === "fullName") {
+    await renameHandler(row.id, next);
+    if (kind === "admin" && row.id === ctx.session.id) {
+      const nextSession = { ...ctx.session, fullName: next };
+      setSession(nextSession);
+      ctx.session = nextSession;
+      ctx.setName(next);
+    }
+  }
+  if (kind === "admin" && spec.key === "email" && row.id === ctx.session.id) {
+    const nextSession = { ...ctx.session, email: next };
+    setSession(nextSession);
+    ctx.session = nextSession;
+  }
+}
+
+async function renameHandler(employeeId, name) {
+  const clients = await readList(paths.clients);
+  await Promise.all(clients.map(async (client) => {
+    const patch = {};
+    if (client.assignedTo === employeeId && client.assignedName !== name) patch.assignedName = name;
+    if (client.crew && client.crew[employeeId] && client.crew[employeeId].name !== name) {
+      patch.crew = { ...client.crew, [employeeId]: { ...client.crew[employeeId], name } };
+    }
+    if (Object.keys(patch).length) await saveRow(paths.clients, client.id, patch);
+  }));
+}
+
+function tileMark(label) {
+  return el("i", "rich-mark", (label || "•").slice(0, 1).toUpperCase());
+}
+
+function penIcon() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z");
+  svg.append(path);
+  return svg;
+}
+
+function lockedTile(label, value) {
+  const item = el("div", "profile-tile locked");
+  const top = el("div", "profile-tile-top");
+  top.append(tileMark(label));
+  item.append(top, el("span", null, label), el("b", null, value || "—"));
+  return item;
+}
+
+function hiredOn(ms) {
+  return ms ? new Date(ms).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "—";
+}
+
+function accountLabel(status) {
+  if (!status || status === "active") return "Active";
+  if (status === "pending") return "Waiting for approval";
+  if (status === "hold") return "On hold";
+  if (status === "rejected") return "Rejected";
+  return status;
+}
+
+function cleanCode(code) {
+  const text = String(code || "").trim();
+  if (!text || text.toLowerCase() === "none") return "";
+  return text;
 }
 
 async function createEmp(ctx) {
@@ -624,8 +1090,9 @@ async function createEmp(ctx) {
   });
   if (!data) return;
   try {
-    await createEmployee(data);
-    ctx.toast("Employee created");
+    const pending = !isMaster(ctx.session);
+    await createEmployee({ ...data, accountStatus: pending ? "pending" : "active" });
+    ctx.toast(pending ? "Sent to Master Admin for approval" : "Employee created");
   } catch (error) {
     ctx.toast(error.message || "Could not create.");
   }
@@ -656,64 +1123,57 @@ async function editEmp(ctx, row) {
 export function pageAdmins(session) {
   const ctx = startPortal(session, "admin-admins");
   ctx.setHeading("Admin", "Admins");
-  ctx.actions.append(button("Add account", "btn solid", () => createAdm(ctx)));
-  const showPassword = canSeePasswords(session);
-  const headers = ["Name", "Role", "Email", "Mobile", ...(showPassword ? ["Password"] : []), "Actions"];
-  let latest = [];
+  if (canManageAdmins(session)) ctx.actions.append(button("Add account", "btn solid", () => createAdm(ctx)));
+  let admins = [];
+  let clients = [];
   let role = "All";
+  let query = "";
   const filter = roleFilter(roleChoices(session), (value) => {
     role = value;
     paint();
   });
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search name, email, or role";
+  search.setAttribute("aria-label", "Search admins");
+  search.addEventListener("input", () => {
+    query = search.value.trim().toLowerCase();
+    paint();
+  });
+  const tools = el("div", "toolbar cl-filters");
+  tools.append(search, filter.bar);
   const list = el("div", "stack");
   list.append(loader("Loading admins"));
-  ctx.panel.append(el("p", "lede", "All admin accounts."), filter.bar, list);
+  ctx.panel.append(el("p", "lede", accessLede(session, "admin")), tools, list);
   const paint = () => {
+    ctx.setHeading("Admin", `Admins · ${admins.length}`);
     const current = filter.select.value || "All";
     filter.select.replaceChildren();
     ["All", ...roleChoices(session)].forEach((name) => {
-      const count = name === "All" ? latest.length : latest.filter((row) => normalizeAdminRole(row.role) === name).length;
+      const count = name === "All" ? admins.length : admins.filter((row) => normalizeAdminRole(row.role) === name).length;
       const option = el("option", null, `${name} · ${count}`);
       option.value = name;
       filter.select.append(option);
     });
     filter.select.value = current;
     role = current;
-    ctx.setHeading("Admin", `Admins · ${latest.length}`);
-    const rows = latest.filter((row) => role === "All" || normalizeAdminRole(row.role) === role);
-    list.replaceChildren(tableWrap(headers, rows.map((row) => {
-      const actions = el("div", "actions");
-      if (canEditAdmin(ctx.session, row)) {
-        actions.append(button("Edit", "btn ghost", () => editAdm(ctx, row)));
-        actions.append(button("Delete", "btn warn", async () => {
-          if (latest.length <= 1) {
-            ctx.toast("The last admin cannot be deleted.");
-            return;
-          }
-          if (isLastMaster(latest, row)) {
-            ctx.toast("The last Master Admin cannot be deleted.");
-            return;
-          }
-          if (!await ctx.ask(`Delete ${row.fullName}? Work history stays.`)) return;
-          await deleteRow(paths.admins, row.id);
-          if (row.id === ctx.session.id) {
-            const { clearSession } = await import("./session.js");
-            clearSession();
-            location.href = "login.html";
-            return;
-          }
-          ctx.toast("Deleted");
-        }));
-      }
-      const cells = [row.fullName, normalizeAdminRole(row.role), row.email, row.mobile];
-      if (showPassword) cells.push(row.password || "Not stored yet");
-      cells.push(actions);
-      return cells;
-    })));
+    const rows = admins.filter((row) => {
+      if (role !== "All" && normalizeAdminRole(row.role) !== role) return false;
+      if (!query) return true;
+      return [row.fullName, row.email, row.mobile, normalizeAdminRole(row.role)].join(" ").toLowerCase().includes(query);
+    });
+    if (!rows.length) {
+      list.replaceChildren(el("p", "quiet", "No admins match this search."));
+      return;
+    }
+    const board = el("div", "emp-board");
+    rows.forEach((row, index) => board.append(personRow(ctx, row, clients, index + 1, "admin")));
+    list.replaceChildren(board);
   };
-  watch(["admins"], (data) => {
+  watch(["admins", "clients"], (data) => {
     if (!data) return denied(list);
-    latest = data.admins;
+    admins = data.admins || [];
+    clients = [...(data.clients || [])].sort((a, b) => String(a.companyName || "").localeCompare(String(b.companyName || "")));
     paint();
   });
 }
@@ -732,8 +1192,9 @@ async function createAdm(ctx) {
   });
   if (!data) return;
   try {
-    await createAdmin({ ...data, createdBy: ctx.session.id });
-    ctx.toast("Account created");
+    const pending = !isMaster(ctx.session);
+    await createAdmin({ ...data, createdBy: ctx.session.id, accountStatus: pending ? "pending" : "active" });
+    ctx.toast(pending ? "Sent to Master Admin for approval" : "Account created");
   } catch (error) {
     ctx.toast(error.message || "Could not create.");
   }

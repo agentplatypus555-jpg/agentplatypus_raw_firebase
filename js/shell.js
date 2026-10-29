@@ -1,5 +1,6 @@
-import { canManageAdmins, canManageFollowups, normalizeAdminRole } from "./roles.js";
-import { clearSession } from "./session.js";
+import { canManageAdmins, canManageFollowups, isMaster, normalizeAdminRole } from "./roles.js";
+import { clearSession, homeFor } from "./session.js";
+import { employeeLocked } from "./client-work.js";
 import { listenMany, watchConnection } from "./db.js";
 import { button, el, field, loader, readForm } from "./ui.js";
 
@@ -21,6 +22,9 @@ export function linksFor(session) {
   }
   if (canManageAdmins(session)) {
     links.push(["admin-admins", "Admins", "admin-admins.html"]);
+  }
+  if (isMaster(session)) {
+    links.push(["admin-requests", "Requests", "admin-requests.html"]);
   }
   return links;
 }
@@ -54,6 +58,7 @@ const navIcons = {
   "admin-profile": "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM5 20a7 7 0 0 1 14 0",
   "admin-followups": "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
   "admin-clients": "M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6",
+  "admin-requests": "M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11",
   "admin-client": "M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6",
   employee: "M4 5h7v7H4zM13 5h7v4h-7zM13 12h7v7h-7zM4 15h7v4H4z",
   "employee-dashboard": "M4 13h6V4H4zM14 20h6V4h-6zM4 20h6v-5H4z",
@@ -64,6 +69,16 @@ const navIcons = {
   "employee-clients": "M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6",
   "employee-client": "M3 21h18M5 21V8l7-4 7 4v13M9 21v-6h6v6",
 };
+
+function backArrow() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M15 18l-6-6 6-6");
+  svg.append(path);
+  return svg;
+}
 
 function icon(id) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -194,7 +209,25 @@ export function startPortal(session, page) {
   const top = el("div", "top");
   const titles = el("div", "titles");
   const heading = el("h1", null, "");
-  titles.append(heading);
+  let backTarget = "";
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "back-arrow";
+  backBtn.setAttribute("aria-label", "Back");
+  backBtn.title = "Back";
+  backBtn.append(backArrow());
+  backBtn.addEventListener("click", () => {
+    if (backTarget) {
+      location.href = backTarget;
+      return;
+    }
+    if (history.length > 1) {
+      history.back();
+      return;
+    }
+    location.href = homeFor(session);
+  });
+  titles.append(backBtn, heading);
   const actions = el("div", "top-actions actions");
   top.append(titles, actions);
   const panel = el("div", "panel");
@@ -217,6 +250,12 @@ export function startPortal(session, page) {
     panel,
     actions,
     setHeading(_kicker, titleText) { heading.textContent = titleText || ""; },
+    setBack(href, label) {
+      backTarget = href || "";
+      const name = label || "Back";
+      backBtn.title = name;
+      backBtn.setAttribute("aria-label", name);
+    },
     setName: chrome.setName,
     openForm,
     ask,
@@ -229,14 +268,19 @@ function bindNavCounts(session, portal) {
   listenMany(keys, (data, ready) => {
     if (!ready) return;
     const followups = session.kind === "employee"
-      ? (data.followups || []).filter((row) => row.assignedTo === session.id)
-      : (data.followups || []);
-    const clients = session.kind === "employee"
-      ? (data.clients || []).filter((row) => row.assignedTo === session.id || row.convertedBy === session.id)
-      : (data.clients || []);
+      ? (data.followups || []).filter((row) => row.assignedTo === session.id || Boolean(row.assignees && row.assignees[session.id]))
+      : (data.followups || []).filter((row) => {
+        if (isMaster(session) || !row.clientId) return true;
+        const client = (data.clients || []).find((item) => item.id === row.clientId);
+        return !client || !employeeLocked(session, client);
+      });
+    const clients = (data.clients || []).filter((row) => !employeeLocked(session, row));
+    const waiting = [...(data.employees || []), ...(data.admins || [])]
+      .filter((row) => row.accountStatus === "pending" || row.accountStatus === "hold").length;
     const counts = {
       "admin-employees": (data.employees || []).length,
       "admin-admins": (data.admins || []).length,
+      "admin-requests": waiting,
       "admin-followups": followups.length,
       "admin-clients": clients.length,
       "employee-followups": followups.length,
@@ -256,11 +300,19 @@ function bindNavCounts(session, portal) {
   });
 }
 
-export function startCard(title) {
+export function startCard(title, backHref) {
   const root = document.getElementById("root");
   const chrome = mountBar({ title: title || "Sign in", session: null });
   const wrap = el("div", "auth");
   const card = el("section", "auth-card");
+  if (backHref) {
+    const back = el("a", "back-arrow");
+    back.href = backHref;
+    back.setAttribute("aria-label", "Back");
+    back.title = "Back";
+    back.append(backArrow());
+    card.append(back);
+  }
   wrap.append(card);
   root.replaceChildren(chrome.bar, wrap, ensureForm(), ensureAsk());
   return card;
