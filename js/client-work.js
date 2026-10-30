@@ -325,7 +325,7 @@ export function channelDetail(ctx, row, platformId) {
     return el("p", "quiet", "This social page is not turned on.");
   }
   if (!maintainsClient(ctx.session, row)) return el("p", "quiet", "You are not assigned to maintain this client.");
-  return platformCard(ctx, row, item, canSetWork(ctx.session));
+  return platformCard(ctx, row, item);
 }
 
 function socialSquare(session, row, item) {
@@ -350,8 +350,54 @@ function socialSquare(session, row, item) {
     meters.append(meter);
   });
   if (!meters.childElementCount) meters.append(el("p", "quiet", "No plan yet"));
-  link.append(head, meters);
+  link.append(head, basicSummary(item, channel), meters);
   return link;
+}
+
+function basicSummary(item, channel) {
+  const done = item.basics.filter(([key]) => channel.basics && channel.basics[key]).length;
+  const block = el("div", "soc-basic");
+  const top = el("div", "soc-meter-top");
+  top.append(el("span", null, "Basic work"), el("b", null, `${done}/${item.basics.length}`));
+  const track = el("div", `dm-track${done >= item.basics.length ? " done" : ""}`);
+  const fill = el("span");
+  fill.style.width = `${Math.round((done / item.basics.length) * 100)}%`;
+  track.append(fill);
+  const titles = el("div", "soc-basic-titles");
+  item.basics.forEach(([key, label]) => titles.append(el("span", channel.basics && channel.basics[key] ? "on" : "", label)));
+  block.append(top, track, titles);
+  return block;
+}
+
+function basicPanel(ctx, row, item) {
+  const channel = channelOf(row, item.id);
+  const done = item.basics.filter(([key]) => channel.basics && channel.basics[key]).length;
+  const block = el("div", "dm-basic");
+  block.append(el("h4", null, `Basic work · ${done}/${item.basics.length}`));
+  const track = el("div", `dm-track${done >= item.basics.length ? " done" : ""}`);
+  const fill = el("span");
+  fill.style.width = `${Math.round((done / Math.max(item.basics.length, 1)) * 100)}%`;
+  track.append(fill);
+  block.append(track, basicTasks(ctx, row, item));
+  return block;
+}
+
+function basicTasks(ctx, row, item) {
+  const channel = channelOf(row, item.id);
+  const tasks = el("div", "dm-tasks");
+  item.basics.forEach(([key, label]) => {
+    const on = Boolean(channel.basics && channel.basics[key]);
+    const task = button(label, `dm-task${on ? " on" : ""}`, () => patch(ctx, row, (current) => {
+      const socials = { ...(current.socials || {}) };
+      const prev = socials[item.id] || {};
+      socials[item.id] = { ...prev, basics: { ...(prev.basics || {}), [key]: !prev.basics?.[key] } };
+      return { ...current, socials };
+    }, ""));
+    task.setAttribute("aria-pressed", String(on));
+    task.prepend(el("i", null, on ? "✓" : ""));
+    tasks.append(task);
+  });
+  return tasks;
 }
 
 function progressLines(item, channel) {
@@ -372,7 +418,7 @@ export function workBoard(ctx, row, employees) {
   if (manager) nodes.push(setupCard(ctx, row, employees));
   if (row.serviceLine === "Digital marketing" && maintainsClient(ctx.session, row)) {
     const enabled = PLATFORMS.filter((item) => channelOf(row, item.id).enabled);
-    if (enabled.length) nodes.push(...enabled.map((item) => platformCard(ctx, row, item, manager)));
+    if (enabled.length) nodes.push(...enabled.map((item) => platformCard(ctx, row, item)));
     else if (manager) nodes.push(el("p", "quiet", "Turn on the social pages this client actually uses. Only those cards show on the profile."));
   }
   return nodes;
@@ -473,13 +519,14 @@ function socialRow(ctx, row, item) {
   main.append(mark, name, toggle);
   rowEl.append(main);
   if (!channel.enabled) return rowEl;
+  rowEl.append(basicPanel(ctx, row, item));
   if (splitWork(item)) {
     const kinds = el("div", "dm-kinds");
     CONTENT_KINDS.forEach(([kindId, label, unit]) => kinds.append(kindSetup(ctx, row, item, kindId, label, unit)));
     rowEl.append(kinds);
-    return rowEl;
+  } else {
+    main.append(...planControls(ctx, row, item, "video", item.unit, channel));
   }
-  main.append(...planControls(ctx, row, item, "video", item.unit, channel));
   return rowEl;
 }
 
@@ -544,42 +591,22 @@ function saveKind(ctx, row, id, kindId, patchKind, message) {
   }, message);
 }
 
-function platformCard(ctx, row, item, manager) {
+function platformCard(ctx, row, item) {
   const channel = channelOf(row, item.id);
   const card = el("article", "dm-card");
   card.style.setProperty("--dm", item.color);
   const head = el("header", "dm-head");
   const mark = el("b", null, item.name.slice(0, 1));
   const title = el("div");
-  title.append(el("strong", null, item.name));
-  head.append(mark, title);
-  card.append(head);
-  if (manager) {
-    const doneBasics = item.basics.filter(([key]) => channel.basics && channel.basics[key]).length;
-    const basicPercent = Math.round((doneBasics / item.basics.length) * 100);
-    title.append(el("small", null, `Basic work ${doneBasics}/${item.basics.length}`));
-    head.append(el("em", null, `${basicPercent}%`));
-    const basicBar = el("div", "dm-track");
-    const basicFill = el("span");
-    basicFill.style.width = `${basicPercent}%`;
-    basicBar.append(basicFill);
-    const tasks = el("div", "dm-tasks");
-    item.basics.forEach(([key, label]) => {
-      const on = Boolean(channel.basics && channel.basics[key]);
-      const task = button(label, `dm-task${on ? " on" : ""}`, () => patch(ctx, row, (current) => {
-        const socials = { ...(current.socials || {}) };
-        const prev = socials[item.id] || {};
-        socials[item.id] = { ...prev, basics: { ...(prev.basics || {}), [key]: !prev.basics?.[key] } };
-        return { ...current, socials };
-      }, ""));
-      task.setAttribute("aria-pressed", String(on));
-      task.prepend(el("i", null, on ? "✓" : ""));
-      tasks.append(task);
-    });
-    card.append(basicBar, tasks);
-  } else {
-    title.append(el("small", null, "Work feed"));
-  }
+  const doneBasics = item.basics.filter(([key]) => channel.basics && channel.basics[key]).length;
+  const basicPercent = Math.round((doneBasics / item.basics.length) * 100);
+  title.append(el("strong", null, item.name), el("small", null, `Basic work ${doneBasics}/${item.basics.length}`));
+  head.append(mark, title, el("em", null, `${basicPercent}%`));
+  const basicBar = el("div", "dm-track");
+  const basicFill = el("span");
+  basicFill.style.width = `${basicPercent}%`;
+  basicBar.append(basicFill);
+  card.append(head, basicBar, basicTasks(ctx, row, item));
   const lanes = splitWork(item)
     ? CONTENT_KINDS.filter(([kindId]) => laneOf(channel, kindId).enabled)
     : [["video", "Work", item.unit]];

@@ -1489,7 +1489,19 @@ button.linkish:hover { text-decoration: underline; }
   color: #fff;
   font-size: 16px;
 }
-.soc-meters { display: grid; gap: 8px; }
+.soc-meters, .soc-basic { display: grid; gap: 8px; }
+.soc-basic-titles { display: flex; flex-wrap: wrap; gap: 6px; }
+.soc-basic-titles span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #f5f8ff;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.soc-basic-titles span.on { background: #e8f8ef; color: #166534; }
+.dm-basic { display: grid; gap: 8px; padding: 0 0 8px; }
+.dm-basic h4 { margin: 4px 0 0; font-size: 13px; }
 .soc-meter-top { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
 .soc-meter-top span { color: var(--muted); font-weight: 700; }
 .profile-hero, .profile-card, .profile-stat {
