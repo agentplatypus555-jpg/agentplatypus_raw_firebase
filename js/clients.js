@@ -1,6 +1,6 @@
 import { channelDetail, employeeLocked, closeAccessDenied, showAccessDenied, socialBoard, workSetup } from "./client-work.js";
-import { addRow, changeRow, listen, listenMany, paths, readList, saveRow } from "./db.js";
-import { canControlAccess, canManageAdmins, canManageFollowups, normalizeAdminRole } from "./roles.js";
+import { addRow, changeRow, deleteRow, listen, listenMany, paths, readList, saveRow } from "./db.js";
+import { canControlAccess, canManageAdmins, canManageFollowups, isMaster, normalizeAdminRole } from "./roles.js";
 import { startPortal } from "./shell.js";
 import { button, el, field, loader } from "./ui.js";
 
@@ -39,6 +39,14 @@ export function pageAdminClientSetup(session) {
 
 export function pageAdminClientTeam(session) {
   return renderClientTeam(session, "admin-clients");
+}
+
+export function pageAdminClientDanger(session) {
+  if (!isMaster(session)) {
+    location.replace("admin-clients.html");
+    return;
+  }
+  return renderClientDanger(session, "admin-clients");
 }
 
 export function pageAdminClientChannel(session) {
@@ -234,7 +242,7 @@ function clientAppCard(session, row) {
   const avatar = el("b", null, (row.companyName || row.clientName || "C").slice(0, 1).toUpperCase());
   const names = el("div");
   names.append(el("strong", null, row.companyName || "Company"), el("small", null, row.clientName || "Client"));
-  top.append(avatar, names, el("em", null, row.clientCode || "—"));
+  top.append(avatar, names, el("em", null, row.paused ? "Paused" : (row.clientCode || "—")));
   card.append(top);
   const open = () => { location.href = clientHref(session, row.id); };
   card.addEventListener("click", open);
@@ -356,6 +364,13 @@ function renderClientTeam(session, navPage) {
   }, (ctx, row, data) => teamBoard(ctx, row, data.employees || [], data.admins || []), ["clients", "employees", "admins"]);
 }
 
+function renderClientDanger(session, navPage) {
+  openClient(session, navPage, "Danger zone", {
+    label: "Back to profile",
+    href: (id) => profileHref(session, id),
+  }, (ctx, row, data) => dangerBoard(ctx, row, data.employees || [], data.admins || [], data.followups || []), ["clients", "employees", "admins", "followups"]);
+}
+
 function renderClientDetails(session, navPage) {
   openClient(session, navPage, "Profile details", {
     label: "Back to profile",
@@ -409,6 +424,112 @@ function teamBoard(ctx, row, employees, admins) {
   page.append(head, handlerTable(ctx, row, employees, admins));
   if (assignDialog?.open) paintAssignList(assignDialog, ctx, row, employees, admins);
   return page;
+}
+
+const SOCIAL_LABELS = {
+  instagram: "Instagram",
+  facebook: "Facebook",
+  youtube: "YouTube",
+  linkedin: "LinkedIn",
+  x: "X",
+};
+
+function dangerBoard(ctx, row, employees, admins, followups) {
+  const page = el("div", "stack");
+  page.append(el("p", "lede", "Review linked data and assigned people before you pause or delete this client."));
+  page.append(linkedSnapshot(row, employees, admins, followups));
+  page.append(masterClientControls(ctx, row));
+  return page;
+}
+
+function linkedSnapshot(row, employees, admins, followups) {
+  const wrap = el("div", "stack");
+  wrap.append(snapshotCard("Client snapshot", [
+    ["Client code", row.clientCode],
+    ["Company", row.companyName],
+    ["Person", row.clientName],
+    ["Location", [row.city, row.state, row.location].filter(Boolean).join(", ")],
+    ["Status", row.paused ? "Paused (Master only)" : "Live"],
+    ["Paused at", row.paused && row.pausedAt ? new Date(row.pausedAt).toLocaleString() : ""],
+  ]));
+
+  const followCard = el("section", "profile-card");
+  followCard.append(el("h2", null, "Linked follow-up"));
+  const follow = (followups || []).find((item) => item.id === row.followupId);
+  if (!row.followupId) {
+    followCard.append(el("p", "quiet", "No follow-up is linked."));
+  } else if (!follow) {
+    followCard.append(el("p", "quiet", `Linked follow-up ${row.followupId} is missing.`));
+  } else {
+    followCard.append(kvTable([
+      ["Company", follow.companyName],
+      ["Person", follow.clientName],
+      ["Stage", follow.stage],
+      ["Follow-up ID", follow.id],
+    ]));
+  }
+  wrap.append(followCard);
+
+  const peopleCard = el("section", "profile-card");
+  peopleCard.append(el("h2", null, "Assigned people"));
+  const people = accessPeople(row);
+  if (!people.length) {
+    peopleCard.append(el("p", "quiet", "No employees, HR Admins, or Admins are assigned."));
+  } else {
+    peopleCard.append(dataTable(["S.No", "Name", "Role", "Email", "Mobile", "Access"], people.map((person, index) => {
+      const record = accountRecord(person.id, employees, admins);
+      return [
+        serialMark(index + 1),
+        person.name || record.fullName || "Account",
+        record.role || "Employee",
+        record.email || "—",
+        record.mobile || "—",
+        el("span", person.paused ? "req-status hold" : "req-status live", person.paused ? "Paused" : "Active"),
+      ];
+    })));
+  }
+  wrap.append(peopleCard);
+
+  const socialCard = el("section", "profile-card");
+  socialCard.append(el("h2", null, "Social pages & work"));
+  const socials = Object.entries(row.socials || {});
+  if (!socials.length) {
+    socialCard.append(el("p", "quiet", "No social pages are saved."));
+  } else {
+    socialCard.append(dataTable(["S.No", "Platform", "On", "Basics done", "Posts / links"], socials.map(([id, channel], index) => [
+      serialMark(index + 1),
+      SOCIAL_LABELS[id] || id,
+      channel?.enabled ? "Enabled" : "Off",
+      String(Object.values(channel?.basics || {}).filter(Boolean).length),
+      String(channelPostCount(channel)),
+    ])));
+  }
+  wrap.append(socialCard);
+
+  wrap.append(snapshotCard("Deal & notes", [
+    ["Quote", row.quoteAmount],
+    ["Payment", row.paymentAmount],
+    ["Final", row.finalAmount],
+    ["Notes", row.notes],
+  ]));
+  return wrap;
+}
+
+function snapshotCard(title, pairs) {
+  const card = el("section", "profile-card");
+  card.append(el("h2", null, title));
+  card.append(kvTable(pairs));
+  return card;
+}
+
+function kvTable(pairs) {
+  return dataTable(["Field", "Value"], pairs.map(([label, value]) => [label, value == null || value === "" ? "—" : String(value)]));
+}
+
+function channelPostCount(channel) {
+  const own = Object.keys(channel?.posts || {}).length;
+  const kinds = Object.values(channel?.kinds || {}).reduce((inner, lane) => inner + Object.keys(lane?.posts || {}).length, 0);
+  return own + kinds;
 }
 
 function handlerTable(ctx, row, employees, admins) {
@@ -515,16 +636,20 @@ function accountRecord(id, employees, admins) {
     return {
       person: { kind: "admin", role: admin.role },
       code: normalizeAdminRole(admin.role),
+      role: normalizeAdminRole(admin.role),
       email: admin.email,
       mobile: admin.mobile,
+      fullName: admin.fullName,
     };
   }
   const employee = (employees || []).find((item) => item.id === id);
   return {
     person: { kind: "employee" },
     code: cleanCode(employee?.employeeCode),
+    role: "Employee",
     email: employee?.email,
     mobile: employee?.mobile,
+    fullName: employee?.fullName,
   };
 }
 
@@ -719,6 +844,7 @@ function resumeCard(ctx, row) {
     el("p", null, [row.contactPerson || row.clientName, row.designation].filter(Boolean).join(" · ") || "Client"),
   );
   const chips = el("div", "profile-chips");
+  if (row.paused) chips.append(el("span", "profile-chip paused", "Paused"));
   [["status", row.status || "Active"], ["industry", row.industry || "Industry"], ["location", row.location || "Location"]].forEach(([key, text]) => {
     chips.append(el("span", `profile-chip ${key}`, text));
   });
@@ -726,15 +852,19 @@ function resumeCard(ctx, row) {
   who.append(chips);
   const tools = el("div", "profile-tools");
   if (canManageFollowups(ctx.session)) {
-    tools.append(toolLink(`admin-client-team.html?id=${encodeURIComponent(row.id)}`, "People on this client", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"));
+    tools.append(toolLink(`admin-client-team.html?id=${encodeURIComponent(row.id)}`, "People", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"));
   }
   const details = sessionKindPage(ctx.session, "details");
-  tools.append(toolLink(`${details}?id=${encodeURIComponent(row.id)}`, "Profile details", "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM5 20a7 7 0 0 1 14 0"));
+  tools.append(toolLink(`${details}?id=${encodeURIComponent(row.id)}`, "Details", "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM5 20a7 7 0 0 1 14 0"));
   if (canManageFollowups(ctx.session)) {
-    tools.append(toolLink(`admin-client-setup.html?id=${encodeURIComponent(row.id)}`, "Social settings", "M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM19.4 15a7.8 7.8 0 0 0 .1-2l2-1.2-2-3.4-2.3.6a7 7 0 0 0-1.7-1L15 5h-4l-.5 2.9a7 7 0 0 0-1.7 1L6.5 8.4l-2 3.4L6.5 13a7.8 7.8 0 0 0 0 2l-2 1.2 2 3.4 2.3-.6a7 7 0 0 0 1.7 1L11 22h4l.5-2.9a7 7 0 0 0 1.7-1l2.3.6 2-3.4z"));
+    tools.append(toolLink(`admin-client-setup.html?id=${encodeURIComponent(row.id)}`, "Settings", "M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM19.4 15a7.8 7.8 0 0 0 .1-2l2-1.2-2-3.4-2.3.6a7 7 0 0 0-1.7-1L15 5h-4l-.5 2.9a7 7 0 0 0-1.7 1L6.5 8.4l-2 3.4L6.5 13a7.8 7.8 0 0 0 0 2l-2 1.2 2 3.4 2.3-.6a7 7 0 0 0 1.7 1L11 22h4l.5-2.9a7 7 0 0 0 1.7-1l2.3.6 2-3.4z"));
+  }
+  if (isMaster(ctx.session)) {
+    tools.append(toolLink(`admin-client-danger.html?id=${encodeURIComponent(row.id)}`, "Danger zone", "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01", true));
   }
   hero.append(photo, who, tools);
   page.append(hero);
+  if (row.paused) page.append(el("p", "quiet", "This client is paused. Only Master Admin can see it until it is resumed."));
   const board = socialBoard(ctx.session, row);
   if (board) page.append(board);
   return page;
@@ -745,8 +875,8 @@ function sessionKindPage(session, name) {
   return `${who}-client-${name}.html`;
 }
 
-function toolLink(href, label, path) {
-  const link = el("a", "profile-tool");
+function toolLink(href, label, path, danger) {
+  const link = el("a", danger ? "profile-tool danger" : "profile-tool");
   link.href = href;
   link.setAttribute("aria-label", label);
   link.title = label;
@@ -756,7 +886,7 @@ function toolLink(href, label, path) {
   const shape = document.createElementNS("http://www.w3.org/2000/svg", "path");
   shape.setAttribute("d", path);
   svg.append(shape);
-  link.append(svg);
+  link.append(svg, el("span", null, label));
   return link;
 }
 
@@ -802,6 +932,151 @@ function profileDetails(ctx, row) {
   if (statItems.length) page.append(stats);
   page.append(grid);
   return page;
+}
+
+function masterClientControls(ctx, row) {
+  const wrap = el("div", "stack");
+  const pause = el("section", "profile-card");
+  pause.append(el("h2", null, "Pause client"));
+  pause.append(el("p", "quiet", row.paused
+    ? "This client is hidden from Admin, HR Admin, and employees. Resume it to give them access again."
+    : "Pause hides this client from every login except Master Admin. Work already saved stays."));
+  pause.append(button(row.paused ? "Resume client" : "Pause client", row.paused ? "btn solid" : "btn ghost", () => toggleClientPause(ctx, row)));
+  const packed = clientDataCount(row);
+  const danger = el("section", "profile-card danger-zone");
+  danger.append(el("h2", null, "Delete project"));
+  const emptyRow = el("div", "danger-row");
+  const emptyCopy = el("div");
+  emptyCopy.append(
+    el("strong", null, "Delete empty client"),
+    el("p", "quiet", packed
+      ? `This client has ${packed}. Use delete with data below.`
+      : "No social work, quote, or notes yet. This only removes the empty client."),
+  );
+  const emptyBtn = button("Delete empty client", "btn warn", () => deleteClient(ctx, row, false));
+  if (packed) {
+    emptyBtn.disabled = true;
+    emptyBtn.title = "This client has data";
+  }
+  emptyRow.append(emptyCopy, emptyBtn);
+  const fullRow = el("div", "danger-row");
+  const fullCopy = el("div");
+  fullCopy.append(
+    el("strong", null, "Delete client and all data"),
+    el("p", "quiet", "Permanently delete social work, assignments, and records. Type the company name to confirm, like GitHub."),
+  );
+  fullRow.append(fullCopy, button("Delete all data", "btn warn", () => deleteClient(ctx, row, true)));
+  danger.append(emptyRow, fullRow);
+  wrap.append(pause, danger);
+  return wrap;
+}
+
+function clientDataCount(row) {
+  const posts = Object.values(row.socials || {}).reduce((sum, channel) => {
+    const own = Object.keys(channel?.posts || {}).length;
+    const kinds = Object.values(channel?.kinds || {}).reduce((inner, lane) => inner + Object.keys(lane?.posts || {}).length, 0);
+    return sum + own + kinds;
+  }, 0);
+  const pages = Object.values(row.socials || {}).filter((channel) => channel?.enabled).length;
+  const crew = Object.keys(row.crew || {}).length;
+  const bits = [];
+  if (posts) bits.push(`${posts} fed link${posts === 1 ? "" : "s"}`);
+  if (pages) bits.push(`${pages} social page${pages === 1 ? "" : "s"}`);
+  if (crew) bits.push(`${crew} assigned`);
+  if (row.notes) bits.push("notes");
+  if (row.quoteAmount || row.finalAmount || row.paymentAmount) bits.push("deal money");
+  return bits.join(", ");
+}
+
+async function toggleClientPause(ctx, row) {
+  const next = !row.paused;
+  const ok = await ctx.ask(next
+    ? `Pause ${row.companyName || "this client"}? Admin, HR Admin, and employees will not see it until you resume.`
+    : `Resume ${row.companyName || "this client"}? Assigned people will see it again.`);
+  if (!ok) return;
+  try {
+    await changeRow(paths.clients, row.id, (current) => {
+      if (!current) return current;
+      return { ...current, paused: next, pausedAt: next ? Date.now() : 0, pausedBy: next ? ctx.session.id : "" };
+    });
+    ctx.toast(next ? "Client paused" : "Client resumed");
+  } catch (error) {
+    ctx.toast(error.message || "Could not update the client.");
+  }
+}
+
+async function deleteClient(ctx, row, withData) {
+  const name = String(row.companyName || row.clientName || "").trim();
+  if (withData) {
+    const typed = await confirmDeleteName(row, name);
+    if (!typed) return;
+  } else {
+    if (clientDataCount(row)) {
+      ctx.toast("This client has data. Use delete all data.");
+      return;
+    }
+    if (!await ctx.ask(`Delete empty client ${name || "this client"}? This cannot be undone.`)) return;
+  }
+  try {
+    if (row.followupId) {
+      await saveRow(paths.followups, row.followupId, { clientId: "", clientCode: row.clientCode || "" });
+    }
+    await deleteRow(paths.clients, row.id);
+    ctx.toast(withData ? "Client and all data deleted" : "Empty client deleted");
+    location.href = "admin-clients.html";
+  } catch (error) {
+    ctx.toast(error.message || "Could not delete the client.");
+  }
+}
+
+function confirmDeleteName(row, name) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      dialog.close();
+      resolve(ok);
+    };
+    const dialog = document.createElement("dialog");
+    dialog.className = "sheet danger-sheet";
+    const form = document.createElement("form");
+    const head = el("header");
+    head.append(el("h2", null, "Are you absolutely sure?"));
+    const copy = el("div", "danger-copy");
+    copy.append(
+      el("p", null, "This cannot be undone. This will permanently delete the client, social work, assignments, and records."),
+      el("p", null, `Please type ${name} to confirm.`),
+    );
+    const field = document.createElement("input");
+    field.type = "text";
+    field.autocomplete = "off";
+    field.placeholder = name;
+    field.setAttribute("aria-label", "Type the company name");
+    const footer = el("footer");
+    const cancel = button("Cancel", "btn ghost", () => finish(false));
+    cancel.type = "button";
+    const go = button("I understand, delete this client", "btn warn");
+    go.type = "submit";
+    go.disabled = true;
+    const match = () => field.value.trim().toLowerCase() === name.toLowerCase();
+    field.addEventListener("input", () => { go.disabled = !match(); });
+    footer.append(cancel, go);
+    form.append(head, copy, field, footer);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!match()) return;
+      finish(true);
+    });
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      finish(false);
+    });
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+    field.focus();
+  });
 }
 
 function specByKey(row, key) {

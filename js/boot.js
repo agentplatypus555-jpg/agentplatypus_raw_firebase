@@ -1,7 +1,7 @@
 import { pageAdmins, pageAdminFile, pageEmployeeFile, pageEmployees, pageProfile as pageAdminProfile } from "./admin-pages.js";
 import { pageRequests } from "./requests.js";
 import { pageEmployeeProfile } from "./employee-pages.js";
-import { pageAdminClient, pageAdminClientChannel, pageAdminClientDetails, pageAdminClients, pageAdminClientSetup, pageAdminClientTeam, pageEmployeeClient, pageEmployeeClientChannel, pageEmployeeClientDetails, pageEmployeeClients } from "./clients.js";
+import { pageAdminClient, pageAdminClientChannel, pageAdminClientDanger, pageAdminClientDetails, pageAdminClients, pageAdminClientSetup, pageAdminClientTeam, pageEmployeeClient, pageEmployeeClientChannel, pageEmployeeClientDetails, pageEmployeeClients } from "./clients.js";
 import { pageAdminFollowups, pageEmployeeFollowups } from "./followups.js";
 import { pageForgot, pageLogin, pageRegister, pageSetup } from "./public-pages.js";
 import { canManageAdmins, canManageFollowups, isMaster } from "./roles.js";
@@ -24,6 +24,7 @@ const pages = {
   "admin-client-details": pageAdminClientDetails,
   "admin-client-setup": pageAdminClientSetup,
   "admin-client-team": pageAdminClientTeam,
+  "admin-client-danger": pageAdminClientDanger,
   "admin-client-channel": pageAdminClientChannel,
   "employee-profile": pageEmployeeProfile,
   "employee-followups": pageEmployeeFollowups,
@@ -58,7 +59,9 @@ if (gate.ok && gate.session && page === "admin-requests" && !isMaster(gate.sessi
   location.replace("admin-employees.html");
 } else if (gate.ok && gate.session && page === "admin-followups" && !canManageFollowups(gate.session)) {
   location.replace(homeFor(gate.session));
-} else if (gate.ok && gate.session && ["admin-clients", "admin-client", "admin-client-details", "admin-client-setup", "admin-client-team", "admin-client-channel"].includes(page) && !canManageFollowups(gate.session)) {
+} else if (gate.ok && gate.session && page === "admin-client-danger" && !isMaster(gate.session)) {
+  location.replace("admin-clients.html");
+} else if (gate.ok && gate.session && ["admin-clients", "admin-client", "admin-client-details", "admin-client-setup", "admin-client-team", "admin-client-channel", "admin-client-danger"].includes(page) && !canManageFollowups(gate.session)) {
   location.replace(homeFor(gate.session));
 } else if (gate.ok && gate.session && retired.has(page)) {
   location.replace(homeFor(gate.session));

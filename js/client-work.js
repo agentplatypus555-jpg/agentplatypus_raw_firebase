@@ -190,6 +190,7 @@ function splitWork(item) {
 
 export function employeeLocked(session, row) {
   if (!session || !row || isMaster(session)) return false;
+  if (row.paused) return true;
   if (row.accessHold && row.accessHold[session.id]) return true;
   return !(row.assignedTo === session.id || Boolean(row.crew && row.crew[session.id]));
 }
