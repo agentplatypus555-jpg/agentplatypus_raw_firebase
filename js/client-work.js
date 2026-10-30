@@ -252,30 +252,159 @@ async function patch(ctx, row, updater, message) {
   }
 }
 
-function periodStart(cadence, now = new Date()) {
-  const start = new Date(now);
+function startOfDay(ms = Date.now()) {
+  const start = new Date(ms);
   start.setHours(0, 0, 0, 0);
-  if (cadence === "week") {
-    const day = start.getDay();
-    start.setDate(start.getDate() - (day === 0 ? 6 : day - 1));
-  } else if (cadence === "month") {
-    start.setDate(1);
-  }
   return start.getTime();
 }
 
-function periodLabel(cadence, start) {
-  const date = new Date(start).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+function endOfDay(ms) {
+  const end = new Date(ms);
+  end.setHours(23, 59, 59, 999);
+  return end.getTime();
+}
+
+function dateValue(ms) {
+  return dayKey(ms || Date.now());
+}
+
+function parseDay(value) {
+  if (!value) return 0;
+  const [year, month, day] = String(value).split("-").map(Number);
+  if (!year || !month || !day) return 0;
+  return new Date(year, month - 1, day).getTime();
+}
+
+function shortDate(ms) {
+  return new Date(ms).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function periodDays(cadence) {
+  if (cadence === "week") return 7;
+  if (cadence === "month") return 30;
+  return 1;
+}
+
+function compactDate(ms) {
+  return new Date(ms).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+}
+
+function periodStart(cadence, at = Date.now(), origin = at) {
+  const nowDay = startOfDay(at);
+  if (cadence !== "week" && cadence !== "month") return nowDay;
+  let start = startOfDay(origin);
+  let guard = 0;
+  while (nextPeriod(cadence, start) <= nowDay && guard < 800) {
+    start = nextPeriod(cadence, start);
+    guard += 1;
+  }
+  return start;
+}
+
+function nextPeriod(cadence, start) {
+  const date = new Date(start);
+  date.setDate(date.getDate() + periodDays(cadence));
+  return date.getTime();
+}
+
+function periodEnd(cadence, start) {
+  return nextPeriod(cadence, start) - 1;
+}
+
+function periodLabel(cadence, start, live = true) {
   if (cadence === "week") {
     const end = new Date(start);
     end.setDate(end.getDate() + 6);
-    const endLabel = end.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-    return `This week · ${date} – ${endLabel}`;
+    return `${live ? "This week" : "Week"} · ${compactDate(start)} – ${compactDate(end.getTime())}`;
   }
   if (cadence === "month") {
-    return new Date(start).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+    const end = new Date(start);
+    end.setDate(end.getDate() + 29);
+    return `${live ? "This month" : "Month"} · ${compactDate(start)} – ${compactDate(end.getTime())}`;
   }
-  return `Today · ${date}`;
+  return `${live ? "Today" : "Day"} · ${compactDate(start)}`;
+}
+
+function runMode(source) {
+  return source.runUntil === "date" ? "date" : "manual";
+}
+
+function runFrom(source) {
+  return startOfDay(source.startedAt || Date.now());
+}
+
+function runUntil(source) {
+  let until = endOfDay(Date.now());
+  if (source.closedAt) until = Math.min(until, source.closedAt);
+  if (runMode(source) === "date" && source.endDate) until = Math.min(until, endOfDay(parseDay(source.endDate)));
+  return until;
+}
+
+function planState(source) {
+  if (source.closedAt) return "closed";
+  if (runMode(source) === "date" && source.endDate && Date.now() > endOfDay(parseDay(source.endDate))) return "expired";
+  return "live";
+}
+
+function planStatusText(source) {
+  const state = planState(source);
+  if (state === "closed") return `Closed ${shortDate(source.closedAt)}`;
+  if (state === "expired") return `Plan expired ${shortDate(parseDay(source.endDate))}`;
+  if (runMode(source) === "date" && source.endDate) return `Until ${shortDate(parseDay(source.endDate))}`;
+  return "Until closed";
+}
+
+function slotsFor(source) {
+  const cadence = source.cadence === "week" || source.cadence === "month" ? source.cadence : "day";
+  const goal = Math.max(1, Number(source.target) || 1);
+  const posts = postsOf(source);
+  const origin = runFrom(source);
+  const from = startOfDay(origin);
+  const until = Math.max(from, runUntil(source));
+  const nowSlot = periodStart(cadence, Date.now(), origin);
+  const slots = [];
+  let cursor = from;
+  let guard = 0;
+  while (cursor <= until && cursor <= nowSlot && guard < 800) {
+    const end = periodEnd(cadence, cursor);
+    const done = posts.filter((post) => (post.at || 0) >= cursor && (post.at || 0) <= end).length;
+    slots.push({
+      start: cursor,
+      end,
+      cadence,
+      goal,
+      done,
+      pending: done < goal,
+      current: cursor === nowSlot,
+      label: periodLabel(cadence, cursor, cursor === nowSlot),
+    });
+    cursor = nextPeriod(cadence, cursor);
+    guard += 1;
+  }
+  return slots;
+}
+
+function pendingSlots(source) {
+  return slotsFor(source).filter((slot) => slot.pending);
+}
+
+function lanePatch(source, extra = {}) {
+  const next = {
+    enabled: source.enabled !== false,
+    cadence: source.cadence === "week" || source.cadence === "month" ? source.cadence : "day",
+    target: Number(source.target) || 1,
+    posts: source.posts || {},
+    runUntil: runMode(source),
+    endDate: source.endDate || "",
+    startedAt: source.startedAt || Date.now(),
+    closedAt: source.closedAt || 0,
+    ...extra,
+  };
+  if (next.enabled && !next.startedAt) next.startedAt = Date.now();
+  if (next.enabled && extra.enabled !== false && source.closedAt && extra.closedAt !== source.closedAt) {
+    next.closedAt = extra.closedAt || 0;
+  }
+  return next;
 }
 
 function postsOf(channel) {
@@ -301,9 +430,13 @@ function laneOf(channel, kindId) {
       cadence: channel.cadence || "day",
       target: Number(channel.target) || 1,
       posts: channel.posts || {},
+      runUntil: channel.runUntil || "manual",
+      endDate: channel.endDate || "",
+      startedAt: channel.startedAt || 0,
+      closedAt: channel.closedAt || 0,
     };
   }
-  return { enabled: false, cadence: "day", target: 1, posts: {} };
+  return { enabled: false, cadence: "day", target: 1, posts: {}, runUntil: "manual", endDate: "", startedAt: 0, closedAt: 0 };
 }
 
 export function socialBoard(session, row) {
@@ -339,7 +472,7 @@ function socialSquare(session, row, item) {
   head.append(mark, el("strong", null, item.name));
   const meters = el("div", "soc-meters");
   progressLines(item, channel).forEach((line) => {
-    const meter = el("div", "soc-meter");
+    const meter = el("div", `soc-meter${line.expired ? " expired" : ""}`);
     const top = el("div", "soc-meter-top");
     top.append(el("span", null, line.label), el("b", null, line.text));
     const track = el("div", `dm-track${line.done >= line.goal ? " done" : ""}`);
@@ -347,6 +480,7 @@ function socialSquare(session, row, item) {
     fill.style.width = `${line.percent}%`;
     track.append(fill);
     meter.append(top, track);
+    if (line.note) meter.append(el("small", "soc-note", line.note));
     meters.append(meter);
   });
   if (!meters.childElementCount) meters.append(el("p", "quiet", "No plan yet"));
@@ -405,10 +539,23 @@ function progressLines(item, channel) {
     ? CONTENT_KINDS.filter(([kindId]) => laneOf(channel, kindId).enabled).map(([kindId, label, unit]) => [laneOf(channel, kindId), label, unit])
     : [[channel, item.unit === "videos" ? "Video" : "Work", item.unit]];
   return lanes.map(([source, label, unit]) => {
-    const cadence = source.cadence === "week" || source.cadence === "month" ? source.cadence : "day";
-    const goal = Math.max(1, Number(source.target) || 1);
-    const done = postsOf(source).filter((post) => (post.at || 0) >= periodStart(cadence)).length;
-    return { label, text: `${done}/${goal} ${unit}`, done, goal, percent: Math.min(100, Math.round((done / goal) * 100)) };
+    const slots = slotsFor(source);
+    const live = slots.find((slot) => slot.current) || slots[slots.length - 1];
+    const pending = slots.filter((slot) => slot.pending).length;
+    const state = planState(source);
+    const done = live?.done || 0;
+    const goal = live?.goal || Math.max(1, Number(source.target) || 1);
+    return {
+      label,
+      text: state === "expired" ? "Expired" : `${done}/${goal} ${unit}`,
+      done,
+      goal,
+      percent: Math.min(100, Math.round((done / goal) * 100)),
+      expired: state === "expired",
+      note: state === "expired"
+        ? planStatusText(source)
+        : pending ? `${pending} pending` : planStatusText(source),
+    };
   });
 }
 
@@ -494,12 +641,15 @@ function socialRow(ctx, row, item) {
     const prev = socials[item.id] || {};
     const kinds = { ...(prev.kinds || {}) };
     if (splitWork(item) && !prev.kinds) {
-      kinds.video = {
+      kinds.video = lanePatch({
         enabled: true,
         cadence: prev.cadence || "day",
         target: Number(prev.target) || 1,
         posts: prev.posts || {},
-      };
+        runUntil: prev.runUntil,
+        endDate: prev.endDate,
+        startedAt: prev.startedAt || Date.now(),
+      });
     }
     socials[item.id] = {
       ...prev,
@@ -508,6 +658,10 @@ function socialRow(ctx, row, item) {
       target: Number(prev.target) || 1,
       basics: prev.basics || {},
       posts: prev.posts || {},
+      runUntil: prev.runUntil || "manual",
+      endDate: prev.endDate || "",
+      startedAt: prev.startedAt || Date.now(),
+      closedAt: prev.closedAt || 0,
       ...(splitWork(item) ? { kinds } : {}),
     };
     return { ...current, socials };
@@ -526,6 +680,7 @@ function socialRow(ctx, row, item) {
     rowEl.append(kinds);
   } else {
     main.append(...planControls(ctx, row, item, "video", item.unit, channel));
+    main.append(...durationControls(ctx, row, item, "video", channel));
   }
   return rowEl;
 }
@@ -534,12 +689,18 @@ function kindSetup(ctx, row, item, kindId, label, unit) {
   const lane = laneOf(channelOf(row, item.id), kindId);
   const line = el("div", `dm-kind${lane.enabled ? " on" : ""}`);
   line.append(el("strong", null, label));
-  const toggle = button("", `dm-switch${lane.enabled ? " on" : ""}`, () => saveKind(ctx, row, item.id, kindId, { enabled: !lane.enabled }, lane.enabled ? `${label} hidden.` : `${label} enabled.`));
+  const turningOn = !lane.enabled;
+  const toggle = button("", `dm-switch${lane.enabled ? " on" : ""}`, () => saveKind(ctx, row, item.id, kindId, turningOn
+    ? { enabled: true, startedAt: lane.startedAt || Date.now(), closedAt: 0 }
+    : { enabled: false }, lane.enabled ? `${label} hidden.` : `${label} enabled.`));
   toggle.setAttribute("aria-label", `${lane.enabled ? "Disable" : "Enable"} ${item.name} ${label}`);
   toggle.setAttribute("aria-pressed", String(Boolean(lane.enabled)));
   toggle.append(el("i"));
   line.append(toggle);
-  if (lane.enabled) line.append(...planControls(ctx, row, item, kindId, unit, lane));
+  if (lane.enabled) {
+    line.append(...planControls(ctx, row, item, kindId, unit, lane));
+    line.append(...durationControls(ctx, row, item, kindId, lane));
+  }
   return line;
 }
 
@@ -552,7 +713,11 @@ function planControls(ctx, row, item, kindId, unit, source) {
     cadence.append(option);
   });
   cadence.value = source.cadence === "week" || source.cadence === "month" ? source.cadence : "day";
-  cadence.addEventListener("change", () => saveKind(ctx, row, item.id, kindId, { cadence: cadence.value }, "Plan saved."));
+  cadence.addEventListener("change", () => saveKind(ctx, row, item.id, kindId, {
+    cadence: cadence.value,
+    startedAt: Date.now(),
+    closedAt: 0,
+  }, cadence.value === "week" ? "Weekly plan starts today for 7 days." : cadence.value === "month" ? "Monthly plan starts today for 30 days." : "Daily plan starts today."));
   const count = document.createElement("input");
   count.type = "number";
   count.min = "1";
@@ -566,26 +731,80 @@ function planControls(ctx, row, item, kindId, unit, source) {
   });
   const plan = el("label", "dm-plan-set", unit);
   plan.prepend(count);
-  return [cadence, plan];
+  const group = el("div", "dm-plan-group");
+  group.append(cadence, plan);
+  return [group];
+}
+
+function durationControls(ctx, row, item, kindId, source) {
+  const state = planState(source);
+  const nodes = [];
+  const mode = document.createElement("select");
+  mode.className = "dm-run-select";
+  mode.setAttribute("aria-label", `${item.name} ${kindId} duration`);
+  [["manual", "Until closed"], ["date", "End date"]].forEach(([value, label]) => {
+    const option = el("option", null, label);
+    option.value = value;
+    mode.append(option);
+  });
+  mode.value = runMode(source);
+  mode.addEventListener("change", () => saveKind(ctx, row, item.id, kindId, {
+    runUntil: mode.value,
+    closedAt: 0,
+    startedAt: source.startedAt || Date.now(),
+  }, "Duration saved."));
+  nodes.push(mode);
+  if (runMode(source) === "date") {
+    const end = document.createElement("input");
+    end.type = "date";
+    end.className = "dm-run-date";
+    end.value = source.endDate || "";
+    end.min = dateValue(source.startedAt || Date.now());
+    end.setAttribute("aria-label", `${item.name} ${kindId} end date`);
+    end.addEventListener("change", () => {
+      if (!end.value) {
+        ctx.toast("Pick an end date, or choose until closed.");
+        return;
+      }
+      saveKind(ctx, row, item.id, kindId, { runUntil: "date", endDate: end.value, closedAt: 0, startedAt: source.startedAt || Date.now() }, "End date saved.");
+    });
+    nodes.push(end);
+  }
+  nodes.push(el("em", `dm-run-chip${state === "expired" ? " expired" : ""}`, planStatusText(source)));
+  if (canSetWork(ctx.session)) {
+    if (state === "live" && runMode(source) === "manual") {
+      nodes.push(button("Close", "btn ghost dm-mini", () => saveKind(ctx, row, item.id, kindId, { closedAt: Date.now() }, "Plan closed.")));
+    }
+    if (state === "expired" || state === "closed") {
+      nodes.push(button("Extend", "btn solid dm-mini", () => {
+        const next = new Date();
+        next.setDate(next.getDate() + 30);
+        saveKind(ctx, row, item.id, kindId, {
+          runUntil: "date",
+          endDate: dateValue(next.getTime()),
+          closedAt: 0,
+          startedAt: source.startedAt || Date.now(),
+        }, "Plan extended.");
+      }));
+    }
+  }
+  const group = el("div", "dm-run-group");
+  group.append(...nodes);
+  return [group];
 }
 
 function saveKind(ctx, row, id, kindId, patchKind, message) {
   return patch(ctx, row, (current) => {
     const socials = { ...(current.socials || {}) };
     const prev = socials[id] || {};
-    if (!splitWork(PLATFORMS.find((item) => item.id === id) || {})) {
-      socials[id] = { ...prev, ...patchKind, enabled: true };
+    const platform = PLATFORMS.find((item) => item.id === id) || {};
+    if (!splitWork(platform)) {
+      socials[id] = lanePatch({ ...prev, enabled: true }, patchKind);
       return { ...current, socials };
     }
     const kinds = { ...(prev.kinds || {}) };
     const before = kinds[kindId] || laneOf(prev, kindId);
-    kinds[kindId] = {
-      enabled: before.enabled !== false,
-      cadence: before.cadence || "day",
-      target: Number(before.target) || 1,
-      posts: before.posts || {},
-      ...patchKind,
-    };
+    kinds[kindId] = lanePatch(before, patchKind);
     socials[id] = { ...prev, kinds };
     return { ...current, socials };
   }, message);
@@ -620,80 +839,215 @@ function platformCard(ctx, row, item) {
 
 function laneBlock(ctx, row, item, kindId, label, unit) {
   const source = splitWork(item) ? laneOf(channelOf(row, item.id), kindId) : channelOf(row, item.id);
-  const cadence = source.cadence === "week" || source.cadence === "month" ? source.cadence : "day";
-  const start = periodStart(cadence);
-  const goal = Math.max(1, Number(source.target) || 1);
-  const posts = postsOf(source);
-  const current = posts.filter((post) => (post.at || 0) >= start);
-  const percent = Math.min(100, Math.round((current.length / goal) * 100));
-  const block = el("section", "dm-lane");
+  const state = planState(source);
+  const slots = slotsFor(source);
+  const live = slots.find((slot) => slot.current) || slots[slots.length - 1];
+  const pending = slots.filter((slot) => slot.pending).length;
+  const block = el("section", `dm-lane${state === "expired" ? " expired" : ""}`);
   const plan = el("div", "dm-plan");
   const planTop = el("div", "dm-plan-top");
-  planTop.append(el("span", null, `${label} · ${periodLabel(cadence, start)}`), el("b", null, `${current.length} / ${goal} ${unit}`));
-  const bar = el("div", `dm-track${current.length >= goal ? " done" : ""}`);
+  const title = state === "expired"
+    ? `${label} · Plan expired`
+    : `${label} · ${live ? live.label : periodLabel(source.cadence === "week" || source.cadence === "month" ? source.cadence : "day", periodStart(source.cadence, Date.now(), runFrom(source)))}`;
+  const count = live ? `${live.done} / ${live.goal} ${unit}` : `0 / ${Math.max(1, Number(source.target) || 1)} ${unit}`;
+  planTop.append(el("span", null, title), el("b", null, count), el("em", `dm-run-chip${state === "expired" ? " expired" : ""}`, planStatusText(source)));
+  const bar = el("div", `dm-track${live && live.done >= live.goal ? " done" : ""}`);
   const fill = el("span");
-  fill.style.width = `${percent}%`;
+  fill.style.width = `${live ? Math.min(100, Math.round((live.done / live.goal) * 100)) : 0}%`;
   bar.append(fill);
   plan.append(planTop, bar);
-  block.append(plan, composer(ctx, row, item, kindId, label), feedTable(ctx, row, item, kindId, posts));
+  block.append(plan, workRecord(ctx, row, item, kindId, label, unit, source, state, pending));
   return block;
 }
 
-function composer(ctx, row, item, kindId, label) {
-  const form = el("form", "dm-compose");
-  const url = document.createElement("input");
-  url.type = "url";
-  url.placeholder = `Paste the ${label.toLowerCase()} link`;
-  url.setAttribute("aria-label", `${item.name} ${label} link`);
-  const note = document.createElement("input");
-  note.type = "text";
-  note.placeholder = "Note";
-  note.setAttribute("aria-label", `${item.name} ${label} note`);
-  const add = button("Add", "btn solid", () => {});
-  add.type = "submit";
-  const slot = el("div", "dm-preview-slot");
-  const paintLive = () => {
-    const href = linkFor(url.value);
-    const box = href && href !== "https://" ? previewBox(href) : previewBox("");
-    if (!href || href === "https://") box.classList.add("empty");
-    slot.replaceChildren(box);
-  };
-  paintLive();
-  url.addEventListener("input", paintLive);
-  form.append(slot, url, note, add);
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const href = linkFor(url.value);
-    if (!href || href === "https://") {
-      ctx.toast("Paste a link first.");
-      return;
-    }
-    const postId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    const entry = {
-      url: href,
-      note: note.value.trim(),
-      at: Date.now(),
-      by: ctx.session.id,
-      byName: ctx.session.fullName || "Team",
-    };
-    patch(ctx, row, (current) => {
-      const socials = { ...(current.socials || {}) };
-      const prev = socials[item.id] || {};
-      if (!splitWork(item)) {
-        socials[item.id] = { ...prev, posts: { ...(prev.posts || {}), [postId]: entry } };
-        return { ...current, socials };
-      }
-      const kinds = { ...(prev.kinds || {}) };
-      const before = kinds[kindId] || laneOf(prev, kindId);
-      kinds[kindId] = { ...before, posts: { ...(before.posts || {}), [postId]: entry } };
-      socials[item.id] = { ...prev, kinds };
+function slotPosts(source, slot) {
+  return postsOf(source).filter((post) => (post.at || 0) >= slot.start && (post.at || 0) <= slot.end);
+}
+
+function writePost(ctx, row, item, kindId, postId, entry, message) {
+  return patch(ctx, row, (current) => {
+    const socials = { ...(current.socials || {}) };
+    const prev = socials[item.id] || {};
+    if (!splitWork(item)) {
+      const posts = { ...(prev.posts || {}) };
+      if (entry) posts[postId] = { ...(posts[postId] || {}), ...entry };
+      else delete posts[postId];
+      socials[item.id] = { ...prev, posts };
       return { ...current, socials };
-    }, "Link added.");
-  });
-  return form;
+    }
+    const kinds = { ...(prev.kinds || {}) };
+    const before = kinds[kindId] || laneOf(prev, kindId);
+    const posts = { ...(before.posts || {}) };
+    if (entry) posts[postId] = { ...(posts[postId] || {}), ...entry };
+    else delete posts[postId];
+    kinds[kindId] = { ...before, posts };
+    socials[item.id] = { ...prev, kinds };
+    return { ...current, socials };
+  }, message);
 }
 
 const feedMemory = new Map();
+const workEdit = new Set();
+
+function workLines(source) {
+  const lines = [];
+  slotsFor(source).forEach((slot) => {
+    const existing = slotPosts(source, slot);
+    existing.forEach((post) => lines.push({ slot, post }));
+    const missing = Math.max(0, slot.goal - existing.length);
+    for (let index = 0; index < missing; index += 1) lines.push({ slot, post: null });
+  });
+  return lines;
+}
+
+function workRecord(ctx, row, item, kindId, label, unit, source, state, pending) {
+  const memory = memoryFor(row, item, kindId);
+  const wrap = el("div", "dm-feed");
+  wrap.append(el("h3", null, pending ? `Work record · ${pending} pending` : "Work record"));
+  const tools = el("div", "dm-tools");
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search date, link, or note";
+  search.value = memory.search;
+  const from = document.createElement("input");
+  from.type = "date";
+  from.value = memory.from;
+  const to = document.createElement("input");
+  to.type = "date";
+  to.value = memory.to;
+  tools.append(search, from, to);
+  const host = el("div", "dm-feed-body");
+  wrap.append(tools, host);
+  const paint = () => {
+    memory.search = search.value.trim().toLowerCase();
+    memory.from = from.value;
+    memory.to = to.value;
+    const lines = workLines(source).filter((line) => {
+      const date = dayKey(line.slot.start);
+      if (memory.from && date < memory.from) return false;
+      if (memory.to && date > memory.to) return false;
+      const hay = `${line.slot.label} ${line.post?.url || ""} ${line.post?.note || ""} ${line.post?.byName || ""}`.toLowerCase();
+      return !memory.search || hay.includes(memory.search);
+    });
+    if (!lines.length) {
+      host.replaceChildren(el("p", "quiet", state === "expired" ? "Plan expired. Extend it in settings, then fill missed dates." : "No dates in this plan yet."));
+      return;
+    }
+    host.replaceChildren(recordTable(ctx, row, item, kindId, label, lines, paint));
+  };
+  search.addEventListener("input", paint);
+  from.addEventListener("change", paint);
+  to.addEventListener("change", paint);
+  paint();
+  return wrap;
+}
+
+function recordTable(ctx, row, item, kindId, label, lines, paint) {
+  const wrap = el("div", "table-wrap dm-feed-wrap");
+  const table = document.createElement("table");
+  table.className = "data-table dm-feed-table dm-work-table";
+  const headers = ["S.No", "Date", "Status", "Preview", "Link", "Note", "Action"];
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headers.forEach((name) => headRow.append(el("th", null, name)));
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  lines.forEach((line, index) => body.append(recordRow(ctx, row, item, kindId, label, line, index + 1, paint)));
+  table.append(head, body);
+  wrap.append(table);
+  return wrap;
+}
+
+function recordRow(ctx, row, item, kindId, label, line, serial, paint) {
+  const tr = document.createElement("tr");
+  const saved = Boolean(line.post);
+  const editing = saved && workEdit.has(line.post.id);
+  tr.className = saved && !editing ? "done" : "open";
+  const date = el("div", "dm-date");
+  const endDay = startOfDay(line.slot.end);
+  const range = line.slot.cadence === "day"
+    ? shortDate(line.slot.start)
+    : `${compactDate(line.slot.start)} – ${compactDate(endDay)}`;
+  const sub = line.slot.cadence === "week" ? (line.slot.current ? "This week · 7 days" : "7 days")
+    : line.slot.cadence === "month" ? (line.slot.current ? "This month · 30 days" : "30 days")
+    : (line.slot.current ? "Today" : "Day");
+  date.append(el("strong", null, range), el("small", null, sub));
+  const status = el("span", `req-status ${saved && !editing && line.slot.done >= line.slot.goal ? "live" : "hold"}`, saved && !editing ? "Done" : `Pending ${line.slot.done}/${line.slot.goal}`);
+  const cells = [
+    el("span", "req-no", String(serial)),
+    date,
+    status,
+  ];
+  if (!saved || editing) {
+    const url = document.createElement("input");
+    url.type = "url";
+    url.placeholder = `Paste ${label.toLowerCase()} link`;
+    url.value = line.post?.url || "";
+    const note = document.createElement("input");
+    note.type = "text";
+    note.placeholder = "Note";
+    note.value = line.post?.note || "";
+    const preview = el("div", "dm-preview-slot");
+    const paintPreview = () => {
+      const href = linkFor(url.value);
+      const box = href && href !== "https://" ? previewBox(href) : previewBox("");
+      if (!href || href === "https://") box.classList.add("empty");
+      preview.replaceChildren(box);
+    };
+    url.addEventListener("input", paintPreview);
+    paintPreview();
+    const actions = el("div", "req-actions");
+    actions.append(button("Save", "btn solid dm-mini", () => {
+      const href = linkFor(url.value);
+      if (!href || href === "https://") {
+        ctx.toast("Paste a link first.");
+        return;
+      }
+      const postId = line.post?.id || `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      if (line.post) workEdit.delete(line.post.id);
+      writePost(ctx, row, item, kindId, postId, {
+        url: href,
+        note: note.value.trim(),
+        at: line.post?.at || (line.slot.current ? Date.now() : line.slot.end),
+        by: ctx.session.id,
+        byName: ctx.session.fullName || "Team",
+        forStart: line.slot.start,
+      }, saved ? "Link updated." : "Link saved.");
+    }));
+    if (saved) {
+      actions.append(button("Cancel", "btn ghost dm-mini", () => {
+        workEdit.delete(line.post.id);
+        paint();
+      }));
+    }
+    cells.push(preview, url, note, actions);
+  } else {
+    const link = el("a", null, line.post.note || hostOf(line.post.url));
+    link.href = line.post.url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    const actions = el("div", "req-actions");
+    actions.append(
+      button("Edit", "btn ghost dm-mini", () => {
+        workEdit.add(line.post.id);
+        paint();
+      }),
+      button("Remove", "btn warn dm-mini", async () => {
+        if (!await ctx.ask("Remove this link?")) return;
+        writePost(ctx, row, item, kindId, line.post.id, null, "Link removed.");
+      }),
+    );
+    cells.push(previewBox(line.post.url), link, line.post.note || "—", actions);
+  }
+  cells.forEach((cell, cellIndex) => {
+    const td = document.createElement("td");
+    td.dataset.label = ["S.No", "Date", "Status", "Preview", "Link", "Note", "Action"][cellIndex];
+    if (cell instanceof Node) td.append(cell);
+    else td.textContent = cell;
+    tr.append(td);
+  });
+  return tr;
+}
 
 function memoryFor(row, item, kindId) {
   const key = `${row.id}:${item.id}:${kindId}`;
